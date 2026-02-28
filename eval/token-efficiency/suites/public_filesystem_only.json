@@ -1,0 +1,10 @@
+{
+  "name": "public_filesystem_only",
+  "description": "Public no-auth MCP server (filesystem) for harness sanity checks",
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    }
+  }
+}

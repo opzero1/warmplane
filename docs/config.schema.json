@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://warmplane.dev/schemas/config.schema.json",
+  "title": "Warmplane Config",
+  "type": "object",
+  "required": ["mcpServers"],
+  "properties": {
+    "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+    "toolTimeoutMs": { "type": "integer", "minimum": 1 },
+    "capabilityAliases": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "resourceAliases": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "promptAliases": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "policy": {
+      "type": "object",
+      "properties": {
+        "allow": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": []
+        },
+        "deny": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": []
+        },
+        "redactKeys": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": []
+        }
+      },
+      "additionalProperties": false
+    },
+    "mcpServers": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "$ref": "#/$defs/serverConfig"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "serverConfig": {
+      "type": "object",
+      "properties": {
+        "command": { "type": "string" },
+        "args": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": []
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "default": {}
+        },
+        "url": { "type": "string", "format": "uri" },
+        "protocolVersion": { "type": "string" },
+        "allowStateless": { "type": "boolean" },
+        "headers": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "default": {}
+        },
+        "auth": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": ["type"],
+              "properties": {
+                "type": { "const": "bearer" },
+                "token": { "type": "string" },
+                "tokenEnv": { "type": "string" }
+              },
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "required": ["type", "username"],
+              "properties": {
+                "type": { "const": "basic" },
+                "username": { "type": "string" },
+                "password": { "type": "string" },
+                "passwordEnv": { "type": "string" }
+              },
+              "additionalProperties": false
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["command"]
+          },
+          "then": {
+            "not": { "required": ["url"] }
+          }
+        },
+        {
+          "if": {
+            "required": ["url"]
+          },
+          "then": {
+            "not": { "required": ["command"] }
+          }
+        }
+      ],
+      "anyOf": [
+        { "required": ["command"] },
+        { "required": ["url"] }
+      ],
+      "additionalProperties": false
+    }
+  }
+}

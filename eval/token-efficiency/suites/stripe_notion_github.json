@@ -1,0 +1,23 @@
+{
+  "name": "stripe_notion_github",
+  "description": "Stripe + Notion + GitHub Copilot full mixed suite",
+  "mcpServers": {
+    "stripe": {
+      "command": "npx",
+      "args": ["-y", "@stripe/mcp"]
+    },
+    "notion": {
+      "url": "https://mcp.notion.com/mcp",
+      "protocolVersion": "2025-11-25",
+      "allowStateless": true
+    },
+    "github": {
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headers": {
+        "Authorization": "Bearer ${env:GITHUB_MCP_PAT}"
+      },
+      "protocolVersion": "2025-11-25",
+      "allowStateless": true
+    }
+  }
+}

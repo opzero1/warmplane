@@ -1,0 +1,11 @@
+{
+  "name": "notion_only",
+  "description": "Notion MCP server over streamable HTTP",
+  "mcpServers": {
+    "notion": {
+      "url": "https://mcp.notion.com/mcp",
+      "protocolVersion": "2025-11-25",
+      "allowStateless": true
+    }
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "name": "stripe_notion",
+  "description": "Stripe + Notion mixed transport suite",
+  "mcpServers": {
+    "stripe": {
+      "command": "npx",
+      "args": ["-y", "@stripe/mcp"]
+    },
+    "notion": {
+      "url": "https://mcp.notion.com/mcp",
+      "protocolVersion": "2025-11-25",
+      "allowStateless": true
+    }
+  }
+}

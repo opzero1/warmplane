@@ -1,0 +1,15 @@
+[package]
+name = "token-efficiency-eval"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["clock"] }
+reqwest = { version = "0.12", features = ["json"] }
+rmcp = { version = "0.15.0", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tiktoken-rs = "0.6"
+base64 = "0.22"

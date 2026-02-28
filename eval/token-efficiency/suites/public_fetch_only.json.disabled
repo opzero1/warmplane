@@ -1,0 +1,10 @@
+{
+  "name": "public_fetch_only",
+  "description": "Public no-auth MCP server for harness sanity checks",
+  "mcpServers": {
+    "fetch": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-fetch"]
+    }
+  }
+}

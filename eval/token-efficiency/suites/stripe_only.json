@@ -1,0 +1,10 @@
+{
+  "name": "stripe_only",
+  "description": "Stripe MCP server over stdio",
+  "mcpServers": {
+    "stripe": {
+      "command": "npx",
+      "args": ["-y", "@stripe/mcp"]
+    }
+  }
+}

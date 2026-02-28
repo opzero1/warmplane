@@ -1,0 +1,818 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Warmplane | The local control plane that keeps MCP sessions warm</title>
+        <meta
+            name="description"
+            content="Warmplane is the local control plane that keeps MCP sessions warm for MCP: one compact runtime for tools, resources, and prompts across CLI, HTTP, and MCP-native clients."
+        />
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+        <link
+            href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap"
+            rel="stylesheet"
+        />
+        <style>
+            :root {
+                --bg: #f7f3ea;
+                --ink: #111111;
+                --ink-soft: #38332a;
+                --paper: #fffdf6;
+                --line: #d8cfbc;
+                --accent: #c74a20;
+                --accent-soft: #f1b391;
+                --ok: #1f6f50;
+                --shadow: 0 16px 40px rgba(17, 17, 17, 0.1);
+                --radius: 18px;
+            }
+
+            * {
+                box-sizing: border-box;
+            }
+
+            html,
+            body {
+                margin: 0;
+                padding: 0;
+                background: var(--bg);
+                color: var(--ink);
+                font-family:
+                    "Space Grotesk", "Avenir Next", "Segoe UI", sans-serif;
+            }
+
+            body::before,
+            body::after {
+                content: "";
+                position: fixed;
+                z-index: -1;
+                filter: blur(2px);
+                pointer-events: none;
+            }
+
+            body::before {
+                top: -120px;
+                right: -60px;
+                width: 420px;
+                height: 420px;
+                border-radius: 43% 57% 64% 36% / 37% 41% 59% 63%;
+                background: radial-gradient(
+                    circle at 30% 30%,
+                    #ffd7b9,
+                    #edb690 56%,
+                    transparent 70%
+                );
+                opacity: 0.58;
+            }
+
+            body::after {
+                bottom: -180px;
+                left: -90px;
+                width: 500px;
+                height: 500px;
+                border-radius: 58% 42% 36% 64% / 53% 31% 69% 47%;
+                background: radial-gradient(
+                    circle at 70% 25%,
+                    #f6d372,
+                    #dfac3d 50%,
+                    transparent 70%
+                );
+                opacity: 0.32;
+            }
+
+            .shell {
+                max-width: 1260px;
+                margin: 0 auto;
+                padding: 18px 18px 72px;
+            }
+
+            .topbar {
+                margin-top: 8px;
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 14px;
+            }
+
+            .brand {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                font-weight: 700;
+                letter-spacing: 0.02em;
+                font-size: 1.05rem;
+            }
+
+            .brand-mark {
+                width: 25px;
+                height: 25px;
+                border-radius: 8px;
+                background: linear-gradient(145deg, var(--accent), #d77954);
+                box-shadow: inset 0 0 0 2px rgba(255, 255, 255, 0.35);
+            }
+
+            .status {
+                display: inline-flex;
+                align-items: center;
+                gap: 8px;
+                border: 1px solid var(--line);
+                border-radius: 999px;
+                padding: 7px 12px;
+                background: var(--paper);
+                font-family: "IBM Plex Mono", ui-monospace, monospace;
+                font-size: 0.78rem;
+            }
+
+            .dot {
+                width: 8px;
+                height: 8px;
+                border-radius: 999px;
+                background: var(--ok);
+                box-shadow: 0 0 0 6px rgba(31, 111, 80, 0.12);
+                animation: pulse 1.8s infinite;
+            }
+
+            .hero {
+                margin-top: 14px;
+                background: linear-gradient(
+                    140deg,
+                    rgba(255, 255, 255, 0.9),
+                    rgba(247, 242, 232, 0.88)
+                );
+                border: 1px solid var(--line);
+                border-radius: 26px;
+                box-shadow: var(--shadow);
+                padding: 36px 30px;
+                position: relative;
+                overflow: hidden;
+            }
+
+            .hero::before {
+                content: "";
+                position: absolute;
+                inset: 0;
+                background:
+                    linear-gradient(
+                        to right,
+                        rgba(199, 74, 32, 0.08),
+                        transparent 44%
+                    ),
+                    repeating-linear-gradient(
+                        to right,
+                        transparent 0,
+                        transparent 26px,
+                        rgba(17, 17, 17, 0.03) 27px
+                    );
+                pointer-events: none;
+            }
+
+            .hero-inner {
+                display: grid;
+                grid-template-columns: 1.2fr 0.8fr;
+                gap: 20px;
+                position: relative;
+            }
+
+            h1 {
+                margin: 0;
+                font-size: clamp(2.4rem, 6.7vw, 4.65rem);
+                line-height: 0.92;
+                letter-spacing: -0.04em;
+                max-width: 14ch;
+            }
+
+            .lead {
+                margin-top: 16px;
+                color: var(--ink-soft);
+                font-size: clamp(1.02rem, 2vw, 1.2rem);
+                line-height: 1.46;
+                max-width: 62ch;
+            }
+
+            .lead strong {
+                color: var(--ink);
+            }
+
+            .kpis {
+                margin-top: 18px;
+                display: grid;
+                grid-template-columns: repeat(4, 1fr);
+                gap: 10px;
+            }
+
+            .kpi {
+                border: 1px solid var(--line);
+                border-radius: 12px;
+                background: rgba(255, 253, 246, 0.82);
+                padding: 10px;
+            }
+
+            .kpi strong {
+                display: block;
+                font-size: 0.96rem;
+                color: var(--ink);
+            }
+
+            .kpi span {
+                color: var(--ink-soft);
+                font-size: 0.82rem;
+            }
+
+            .cta {
+                margin-top: 22px;
+                display: flex;
+                flex-wrap: wrap;
+                gap: 10px;
+            }
+
+            .btn {
+                border-radius: 12px;
+                border: 1px solid var(--ink);
+                background: var(--ink);
+                color: #fff;
+                text-decoration: none;
+                font-weight: 700;
+                padding: 11px 14px;
+                transition:
+                    transform 140ms ease,
+                    box-shadow 140ms ease;
+            }
+
+            .btn.alt {
+                background: transparent;
+                color: var(--ink);
+                border-color: var(--line);
+            }
+
+            .btn:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 12px 20px rgba(17, 17, 17, 0.14);
+            }
+
+            .terminal {
+                border-radius: 16px;
+                border: 1px solid #3f3b34;
+                overflow: hidden;
+                background: #181713;
+                color: #eee6d7;
+                box-shadow: 0 16px 28px rgba(17, 17, 17, 0.18);
+                font-family: "IBM Plex Mono", ui-monospace, monospace;
+            }
+
+            .terminal-head {
+                border-bottom: 1px solid #3f3b34;
+                padding: 10px 12px;
+                background: #24221d;
+                color: #cabca4;
+                font-size: 0.78rem;
+            }
+
+            .terminal pre {
+                margin: 0;
+                padding: 13px;
+                white-space: pre-wrap;
+                line-height: 1.45;
+                font-size: 0.84rem;
+            }
+
+            .section {
+                margin-top: 24px;
+            }
+
+            .section h2 {
+                margin: 0 0 12px;
+                font-size: clamp(1.45rem, 2.9vw, 2.08rem);
+                letter-spacing: -0.02em;
+            }
+
+            .section-intro {
+                margin: 0 0 14px;
+                color: var(--ink-soft);
+                max-width: 74ch;
+                line-height: 1.46;
+            }
+
+            .grid {
+                display: grid;
+                grid-template-columns: repeat(12, 1fr);
+                gap: 14px;
+            }
+
+            .panel {
+                background: var(--paper);
+                border: 1px solid var(--line);
+                border-radius: var(--radius);
+                padding: 16px;
+                box-shadow: 0 8px 16px rgba(17, 17, 17, 0.05);
+            }
+
+            .panel h3 {
+                margin: 0 0 8px;
+                font-size: 1.06rem;
+            }
+
+            .panel p {
+                margin: 0;
+                color: var(--ink-soft);
+                line-height: 1.45;
+            }
+
+            .accent-panel {
+                background: linear-gradient(
+                    to bottom right,
+                    rgba(255, 255, 255, 0.72),
+                    rgba(241, 179, 145, 0.22)
+                );
+                border-color: #be8a74;
+            }
+
+            .span-8 {
+                grid-column: span 8;
+            }
+
+            .span-7 {
+                grid-column: span 7;
+            }
+
+            .span-6 {
+                grid-column: span 6;
+            }
+
+            .span-5 {
+                grid-column: span 5;
+            }
+
+            .span-4 {
+                grid-column: span 4;
+            }
+
+            .span-12 {
+                grid-column: span 12;
+            }
+
+            .pill-list {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 8px;
+                margin-top: 12px;
+            }
+
+            .pill {
+                border: 1px solid var(--line);
+                border-radius: 999px;
+                background: var(--paper);
+                padding: 7px 10px;
+                font-size: 0.8rem;
+                color: var(--ink-soft);
+            }
+
+            .steps {
+                display: grid;
+                grid-template-columns: repeat(4, 1fr);
+                gap: 10px;
+            }
+
+            .step {
+                background: var(--paper);
+                border: 1px solid var(--line);
+                border-radius: 12px;
+                padding: 12px;
+            }
+
+            .step-num {
+                display: inline-block;
+                min-width: 26px;
+                text-align: center;
+                border-radius: 999px;
+                background: var(--accent);
+                color: #fff;
+                font-family: "IBM Plex Mono", ui-monospace, monospace;
+                font-size: 0.76rem;
+                padding: 3px 7px;
+                margin-bottom: 8px;
+            }
+
+            .step h4 {
+                margin: 0 0 6px;
+                font-size: 0.98rem;
+            }
+
+            .step p {
+                margin: 0;
+                color: var(--ink-soft);
+                font-size: 0.92rem;
+                line-height: 1.43;
+            }
+
+            .list {
+                margin: 10px 0 0;
+                padding-left: 18px;
+                color: var(--ink-soft);
+                line-height: 1.42;
+            }
+
+            .list li + li {
+                margin-top: 5px;
+            }
+
+            .bottom-cta {
+                margin-top: 28px;
+                border: 1px solid #be8a74;
+                border-radius: 18px;
+                background: linear-gradient(
+                    to right,
+                    rgba(255, 253, 246, 0.88),
+                    rgba(241, 179, 145, 0.28)
+                );
+                padding: 20px;
+                display: flex;
+                flex-wrap: wrap;
+                align-items: center;
+                justify-content: space-between;
+                gap: 12px;
+            }
+
+            .bottom-cta h3 {
+                margin: 0;
+                font-size: 1.18rem;
+            }
+
+            .bottom-cta p {
+                margin: 6px 0 0;
+                color: var(--ink-soft);
+            }
+
+            .fade {
+                opacity: 0;
+                transform: translateY(14px);
+                transition:
+                    opacity 420ms ease,
+                    transform 420ms ease;
+            }
+
+            .fade.show {
+                opacity: 1;
+                transform: translateY(0);
+            }
+
+            footer {
+                margin-top: 26px;
+                color: var(--ink-soft);
+                border-top: 1px solid var(--line);
+                padding-top: 16px;
+                font-size: 0.9rem;
+                display: flex;
+                justify-content: space-between;
+                gap: 12px;
+                flex-wrap: wrap;
+            }
+
+            footer a {
+                color: var(--ink);
+                font-weight: 600;
+            }
+
+            @keyframes pulse {
+                0%,
+                100% {
+                    transform: scale(1);
+                }
+                50% {
+                    transform: scale(1.09);
+                }
+            }
+
+            @media (max-width: 980px) {
+                .hero-inner {
+                    grid-template-columns: 1fr;
+                }
+
+                .kpis {
+                    grid-template-columns: 1fr 1fr;
+                }
+
+                .steps {
+                    grid-template-columns: 1fr 1fr;
+                }
+            }
+
+            @media (max-width: 860px) {
+                .span-8,
+                .span-7,
+                .span-6,
+                .span-5,
+                .span-4 {
+                    grid-column: span 12;
+                }
+
+                .shell {
+                    padding: 14px 14px 42px;
+                }
+
+                .steps {
+                    grid-template-columns: 1fr;
+                }
+
+                .kpis {
+                    grid-template-columns: 1fr;
+                }
+
+                footer {
+                    flex-direction: column;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <main class="shell">
+            <header class="topbar fade">
+                <div class="brand">
+                    <span class="brand-mark"></span>
+                    Warmplane
+                </div>
+                <div class="status"><i class="dot"></i> local control plane runtime</div>
+            </header>
+
+            <section class="hero fade">
+                <div class="hero-inner">
+                    <div>
+                        <h1>Run your MCP estate from one high-signal surface</h1>
+                        <p class="lead">
+                            <strong>Warmplane</strong> sits in front of many MCP servers and emits a compact,
+                            policyable, agent-friendly interface for tools, resources, and prompts. Same substrate,
+                            multiple client modes: CLI, HTTP and MCP.
+                        </p>
+
+                        <div class="kpis">
+                            <div class="kpi">
+                                <strong>Lower context overhead</strong>
+                                <span>Alias-based index first, full schema only on demand.</span>
+                            </div>
+                            <div class="kpi">
+                                <strong>Safer execution path</strong>
+                                <span>Policy gates, allowlists, and deterministic routing.</span>
+                            </div>
+                            <div class="kpi">
+                                <strong>One abstraction, many backends</strong>
+                                <span>Aggregate heterogeneous MCP servers behind one endpoint.</span>
+                            </div>
+                            <div class="kpi">
+                                <strong>Audit-ready telemetry</strong>
+                                <span>Structured JSON logs + OTLP traces with trace correlation.</span>
+                            </div>
+                        </div>
+
+                    </div>
+
+                    <div class="terminal" aria-label="Token efficiency evidence">
+                        <div class="terminal-head">Token Efficiency | measured eval output</div>
+                        <pre><code>Suite: github_copilot_only
+Discovery      54,715 -> 2,386   (95.6% savings)
+5-turn loop   260,005 -> 11,173  (95.7% savings)
+10-turn mixed 547,150 -> 22,895  (95.8% savings)
+
+Control: public_filesystem_only
+Discovery       2,552 -> 1,066   (58.2% savings)
+5-turn loop    12,760 -> 5,349   (58.1% savings)
+10-turn mixed  25,520 -> 10,669  (58.2% savings)
+
+Method
+- Raw: direct MCP tools/resources/prompts surfaces
+- Facade: /v1 indexes + on-demand capability describe
+- Tokenizer: cl100k_base</code></pre>
+                    </div>
+                </div>
+            </section>
+
+            <section class="section fade" id="what-it-is">
+                <h2>What It Actually Solves</h2>
+                <p class="section-intro">
+                    Raw MCP integration is powerful, but large agent systems quickly hit practical friction: schema bulk,
+                    inconsistent server semantics, duplicated policy logic, and exploding routing complexity. Warmplane
+                    packages those concerns into a single managed capability plane that stays small at the protocol edge.
+                </p>
+
+                <div class="grid">
+                    <article class="panel span-4">
+                        <h3>Context Budget Pressure</h3>
+                        <p>
+                            Agent loops pay repeatedly for tool and prompt metadata. Compact indexes and alias contracts
+                            reduce token burn while keeping capability coverage broad.
+                        </p>
+                    </article>
+                    <article class="panel span-4">
+                        <h3>Operational Fragmentation</h3>
+                        <p>
+                            Different MCP servers imply different assumptions. The plane normalizes invocation, result
+                            envelopes, timeout behavior, and error semantics.
+                        </p>
+                    </article>
+                    <article class="panel span-4">
+                        <h3>Governance at Runtime</h3>
+                        <p>
+                            Centralized policy controls allow teams to constrain write actions, separate safe/read paths,
+                            and expose only the right capabilities to each agent role.
+                        </p>
+                    </article>
+                </div>
+            </section>
+
+            <section class="section fade" id="features">
+                <h2>Core Capabilities</h2>
+                <p class="section-intro">
+                    Designed for production agent stacks where tool surfaces must be compact, reliable, and observable.
+                </p>
+
+                <div class="grid">
+                    <article class="panel accent-panel span-8">
+                        <h3>Unified Facade for Tools, Resources, and Prompts</h3>
+                        <p>
+                            Build a lightweight contract over many upstream MCP servers. Clients can enumerate compact
+                            aliases, request expanded detail only when needed, and call through a normalized interface.
+                        </p>
+                        <div class="pill-list">
+                            <span class="pill">Alias Registry</span>
+                            <span class="pill">Compact Schemas</span>
+                            <span class="pill">On-demand Expansion</span>
+                            <span class="pill">MCP Native Exposure</span>
+                        </div>
+                    </article>
+                    <article class="panel span-4">
+                        <h3>Policy Profiles</h3>
+                        <p>
+                            Role-aware controls for read-only, constrained write, and privileged paths. Enforce profile
+                            routing without embedding policy in every agent prompt.
+                        </p>
+                    </article>
+                    <article class="panel span-4">
+                        <h3>Deterministic Routing</h3>
+                        <p>
+                            Route each alias to specific upstream targets with stable behavior. Avoid accidental capability
+                            drift as your MCP graph evolves.
+                        </p>
+                    </article>
+                    <article class="panel span-4">
+                        <h3>Reliable Error Envelope</h3>
+                        <p>
+                            Standardize timeout, retry, and failure responses so agents can recover predictably instead of
+                            branching across server-specific error formats.
+                        </p>
+                    </article>
+                    <article class="panel span-4">
+                        <h3>Transport Flexibility</h3>
+                        <p>
+                            Same capability plane accessible from terminal workflows, HTTP automation, and MCP clients,
+                            reducing duplicated integration effort.
+                        </p>
+                    </article>
+                    <article class="panel span-4">
+                        <h3>Enterprise Observability</h3>
+                        <p>
+                            Emit structured logs for audit trails and export OpenTelemetry traces to existing collectors,
+                            with trace IDs that align response envelopes and runtime events.
+                        </p>
+                    </article>
+                </div>
+            </section>
+
+            <section class="section fade" id="use-cases">
+                <h2>Use Cases</h2>
+                <p class="section-intro">
+                    The system is useful wherever multiple agents or teams need controlled access to a growing capability
+                    graph without paying linear complexity costs.
+                </p>
+
+                <div class="grid">
+                    <article class="panel span-6">
+                        <h3>Agent Platform Teams</h3>
+                        <p>
+                            Publish one stable tool plane to all internal agents while swapping and upgrading upstream MCP
+                            servers independently.
+                        </p>
+                        <ul class="list">
+                            <li>Minimize prompt-level integration details.</li>
+                            <li>Ship org-wide policy defaults once.</li>
+                            <li>Track capability changes at one control point.</li>
+                        </ul>
+                    </article>
+                    <article class="panel span-6">
+                        <h3>Enterprise Governance</h3>
+                        <p>
+                            Separate safe discovery and high-impact actions with profile-based controls and explicit alias
+                            contracts.
+                        </p>
+                        <ul class="list">
+                            <li>Role-specific exposure of tools/resources/prompts.</li>
+                            <li>Auditable routing from alias to backend.</li>
+                            <li>Constrained write paths for regulated workflows.</li>
+                        </ul>
+                    </article>
+                    <article class="panel span-6">
+                        <h3>LLM Cost and Latency Optimization</h3>
+                        <p>
+                            Keep the default interface compact and move heavy schema payloads to just-in-time lookups,
+                            reducing recurring context load in iterative loops.
+                        </p>
+                        <ul class="list">
+                            <li>Smaller baseline tool manifests.</li>
+                            <li>Reduced repetitive metadata transfer.</li>
+                            <li>Faster first-turn actionability for agents.</li>
+                        </ul>
+                    </article>
+                    <article class="panel span-6">
+                        <h3>Multi-Environment Delivery</h3>
+                        <p>
+                            Mirror the same capability plane across local dev, staging, and production with environment-
+                            specific backends behind constant aliases.
+                        </p>
+                        <ul class="list">
+                            <li>Predictable rollouts with stable contracts.</li>
+                            <li>Cleaner testing across transport modes.</li>
+                            <li>Easier incident response and rollback strategy.</li>
+                        </ul>
+                    </article>
+                </div>
+            </section>
+
+            <section class="section fade" id="how">
+                <h2>How Teams Deploy It</h2>
+                <div class="steps">
+                    <article class="step">
+                        <span class="step-num">01</span>
+                        <h4>Attach Servers</h4>
+                        <p>Register MCP backends and map their tools/resources/prompts into a shared alias namespace.</p>
+                    </article>
+                    <article class="step">
+                        <span class="step-num">02</span>
+                        <h4>Define Policy</h4>
+                        <p>Apply profile rules that control which aliases are visible and executable for each caller class.</p>
+                    </article>
+                    <article class="step">
+                        <span class="step-num">03</span>
+                        <h4>Expose Clients</h4>
+                        <p>Serve the same compact plane over CLI, HTTP, and MCP-native server mode for mixed ecosystems.</p>
+                    </article>
+                    <article class="step">
+                        <span class="step-num">04</span>
+                        <h4>Observe + Iterate</h4>
+                        <p>Use normalized invocation events to tune alias design, profile boundaries, and token economics.</p>
+                    </article>
+                </div>
+            </section>
+
+            <section class="section fade" id="ecosystem-fit">
+                <h2>Why This Matters Now</h2>
+                <div class="grid">
+                    <article class="panel span-7 accent-panel">
+                        <h3>MCP Is Growing Fast; Integration Debt Grows Faster</h3>
+                        <p>
+                            As organizations add more MCP servers, direct client integration becomes expensive to maintain.
+                            A managed capability plane decouples agent ergonomics from backend sprawl and creates a
+                            scalable path for long-lived systems.
+                        </p>
+                    </article>
+                    <article class="panel span-5">
+                        <h3>Built for Real Deployment Constraints</h3>
+                        <p>
+                            Warmplane focuses on practical needs: small interfaces, explicit contracts, runtime policy,
+                            and transport compatibility. It is not a demo wrapper; it is a control layer for production
+                            agent operations.
+                        </p>
+                    </article>
+                </div>
+            </section>
+
+            <section class="bottom-cta fade" aria-label="GitHub call to action">
+                <div>
+                    <h3>Build your MCP capability plane with Warmplane.</h3>
+                    <p>Explore the repository, architecture docs, and implementation details.</p>
+                </div>
+                <a class="btn" href="https://github.com/mrorigo/mcp-fast-cli">Visit github.com/mrorigo/mcp-fast-cli</a>
+            </section>
+
+            <footer class="fade">
+                <span>Warmplane | The local control plane that keeps MCP sessions warm</span>
+                <span><a href="https://github.com/mrorigo/mcp-fast-cli">github.com/mrorigo/mcp-fast-cli</a></span>
+            </footer>
+        </main>
+
+        <script>
+            const observer = new IntersectionObserver(
+                (entries) => {
+                    entries.forEach((entry) => {
+                        if (entry.isIntersecting) {
+                            entry.target.classList.add("show");
+                        }
+                    });
+                },
+                {
+                    threshold: 0.1,
+                    rootMargin: "0px 0px -25px 0px",
+                }
+            );
+
+            document.querySelectorAll(".fade").forEach((el) => observer.observe(el));
+        </script>
+    </body>
+</html>
