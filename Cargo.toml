@@ -3,6 +3,13 @@
 name = "warmplane"
 version = "0.1.0"
 edition = "2021"
+description = "Local control plane that keeps MCP sessions warm with compact capability/resource/prompt facades."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/Warmplane/warmplane"
+homepage = "https://github.com/Warmplane/warmplane"
+keywords = ["mcp", "agent", "cli", "proxy", "orchestration"]
+categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 # MCP protocol

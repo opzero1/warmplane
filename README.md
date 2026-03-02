@@ -46,11 +46,13 @@ All three modes share the same backend state, aliases, policy checks, and timeou
 - list: compact prompt index
 - get: normalized prompt rendering envelope
 
-## Build
+## Install
 
 ```bash
-cargo build --release
+cargo install --path .
 ```
+
+`cargo install warmplane` is not available yet because the crate has not been published to crates.io.
 
 ## Validate Config
 
@@ -149,7 +151,7 @@ For bearer/basic, exactly one direct secret (`token`/`password`) or env-backed s
 ### 1) HTTP Daemon
 
 ```bash
-cargo run --release -- daemon --config mcp_servers.json
+warmplane daemon --config mcp_servers.json
 ```
 
 Endpoints:
@@ -165,7 +167,7 @@ Endpoints:
 ### 2) MCP Server (stdio)
 
 ```bash
-cargo run --release -- mcp-server --config mcp_servers.json
+warmplane mcp-server --config mcp_servers.json
 ```
 
 MCP clients can point directly to this process.
@@ -189,17 +191,17 @@ Native MCP methods also supported:
 
 ```bash
 # capabilities
-cargo run --release -- list-capabilities
-cargo run --release -- describe-capability db.query
-cargo run --release -- call-capability db.query --params '{"query":"SELECT 1"}'
+warmplane list-capabilities
+warmplane describe-capability db.query
+warmplane call-capability db.query --params '{"query":"SELECT 1"}'
 
 # resources
-cargo run --release -- list-resources
-cargo run --release -- read-resource fs.readme
+warmplane list-resources
+warmplane read-resource fs.readme
 
 # prompts
-cargo run --release -- list-prompts
-cargo run --release -- get-prompt prompt.code-review --arguments '{"code":"fn main() {}"}'
+warmplane list-prompts
+warmplane get-prompt prompt.code-review --arguments '{"code":"fn main() {}"}'
 ```
 
 ## MCP Client Example
