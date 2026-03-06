@@ -69,7 +69,14 @@ impl ServerHandler for FacadeMcpServer {
         let args = request.arguments.unwrap_or_default();
 
         let output = match request.name.as_ref() {
-            TOOL_CAPABILITIES_LIST => self.list_capabilities_value().await,
+            TOOL_CAPABILITIES_LIST => {
+                self.list_capabilities_value(
+                    args.get("server").and_then(Value::as_str).map(ToString::to_string),
+                    args.get("query").and_then(Value::as_str).map(ToString::to_string),
+                    args.get("limit").and_then(Value::as_u64),
+                )
+                .await
+            }
             TOOL_CAPABILITY_DESCRIBE => {
                 let Some(id) = args.get("id").and_then(Value::as_str) else {
                     return Ok(CallToolResult::structured_error(invalid_args(
@@ -280,11 +287,37 @@ impl ServerHandler for FacadeMcpServer {
 }
 
 impl FacadeMcpServer {
-    async fn list_capabilities_value(&self) -> std::result::Result<Value, String> {
+    async fn list_capabilities_value(
+        &self,
+        server: Option<String>,
+        query: Option<String>,
+        limit: Option<u64>,
+    ) -> std::result::Result<Value, String> {
+        let server = server.map(|value| value.to_lowercase());
+        let query = query.map(|value| value.to_lowercase());
         let mut capabilities = self
             .state
             .capabilities
             .iter()
+            .filter(|(id, meta)| {
+                let server_matches = server
+                    .as_ref()
+                    .map(|value| meta.server.eq_ignore_ascii_case(value))
+                    .unwrap_or(true);
+                if !server_matches {
+                    return false;
+                }
+
+                query
+                    .as_ref()
+                    .map(|value| {
+                        id.to_lowercase().contains(value)
+                            || meta.server.to_lowercase().contains(value)
+                            || meta.tool.to_lowercase().contains(value)
+                            || meta.summary.to_lowercase().contains(value)
+                    })
+                    .unwrap_or(true)
+            })
             .map(|(id, meta)| {
                 json!({
                     "id": id,
@@ -299,6 +332,12 @@ impl FacadeMcpServer {
             .state
             .server_readiness
             .iter()
+            .filter(|(name, _)| {
+                server
+                    .as_ref()
+                    .map(|value| name.eq_ignore_ascii_case(value))
+                    .unwrap_or(true)
+            })
             .map(|(server, readiness)| {
                 json!({
                     "server": server,
@@ -319,6 +358,9 @@ impl FacadeMcpServer {
                 .and_then(|v| v.as_str())
                 .cmp(&b.get("server").and_then(|v| v.as_str()))
         });
+        if let Some(limit) = limit {
+            capabilities.truncate(limit.clamp(1, 100) as usize);
+        }
 
         Ok(json!({
             "version": "v1",
@@ -739,12 +781,20 @@ fn facade_tools() -> Vec<Tool> {
     vec![
         Tool::new(
             TOOL_CAPABILITIES_LIST,
-            "List compact capability index",
-            schema_object(json!({"type":"object","properties":{},"additionalProperties":false})),
+            "START HERE - list available capabilities across every provider; pass server and query to narrow results, and call this first when the exact capability id is unknown",
+            schema_object(json!({
+                "type":"object",
+                "properties":{
+                    "server":{"type":"string"},
+                    "query":{"type":"string"},
+                    "limit":{"type":"integer","minimum":1,"maximum":100}
+                },
+                "additionalProperties":false
+            })),
         ),
         Tool::new(
             TOOL_CAPABILITY_DESCRIBE,
-            "Describe one capability",
+            "Fetch full schema and examples for one capability id; only use this when capabilities_list summary is not enough to build args",
             schema_object(json!({
                 "type":"object",
                 "properties":{"id":{"type":"string"}},
@@ -754,7 +804,7 @@ fn facade_tools() -> Vec<Tool> {
         ),
         Tool::new(
             TOOL_CAPABILITY_CALL,
-            "Call one capability with normalized response envelope",
+            "Invoke a provider capability directly by id with args; skip capability_describe once the capability id and required args are already known",
             schema_object(json!({
                 "type":"object",
                 "properties":{
@@ -768,12 +818,12 @@ fn facade_tools() -> Vec<Tool> {
         ),
         Tool::new(
             TOOL_RESOURCES_LIST,
-            "List compact resource index",
+            "List available resources across providers; use this first to find a resource id before resource_read",
             schema_object(json!({"type":"object","properties":{},"additionalProperties":false})),
         ),
         Tool::new(
             TOOL_RESOURCE_READ,
-            "Read one resource with normalized response envelope",
+            "Read one resource by resource_id from resources_list; call this directly once the resource id is known",
             schema_object(json!({
                 "type":"object",
                 "properties":{
@@ -786,12 +836,12 @@ fn facade_tools() -> Vec<Tool> {
         ),
         Tool::new(
             TOOL_PROMPTS_LIST,
-            "List compact prompt index",
+            "List available prompts across providers; use this first to find a prompt id before prompt_get",
             schema_object(json!({"type":"object","properties":{},"additionalProperties":false})),
         ),
         Tool::new(
             TOOL_PROMPT_GET,
-            "Get one prompt rendering with normalized response envelope",
+            "Render one prompt by prompt_id from prompts_list with optional arguments; call this directly once the prompt id and arg shape are known",
             schema_object(json!({
                 "type":"object",
                 "properties":{
@@ -844,7 +894,9 @@ pub async fn run_mcp_server(config: McpConfig) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{facade_tools, invalid_args};
+    use super::{facade_tools, invalid_args, FacadeMcpServer};
+    use crate::daemon::{AppState, CapabilityMeta, Policy};
+    use std::{collections::HashMap, sync::Arc};
 
     #[test]
     fn facade_tools_include_all_lightweight_operations() {
@@ -869,5 +921,73 @@ mod tests {
         assert_eq!(payload["error"]["code"], "INVALID_ARGS");
         assert_eq!(payload["error"]["message"], "bad input");
         assert_eq!(payload["data"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn capability_list_supports_server_query_and_limit_filters() {
+        let mut capabilities = HashMap::new();
+        capabilities.insert(
+            "figma.whoami".to_string(),
+            CapabilityMeta {
+                server: "figma".to_string(),
+                tool: "whoami".to_string(),
+                summary: "Get the authenticated Figma user".to_string(),
+                description: "desc".to_string(),
+                input_schema: serde_json::json!({}),
+                tags: vec!["figma".to_string()],
+                examples: vec![],
+            },
+        );
+        capabilities.insert(
+            "notion.notion-search".to_string(),
+            CapabilityMeta {
+                server: "notion".to_string(),
+                tool: "notion-search".to_string(),
+                summary: "Search notion users and pages".to_string(),
+                description: "desc".to_string(),
+                input_schema: serde_json::json!({}),
+                tags: vec!["notion".to_string()],
+                examples: vec![],
+            },
+        );
+        capabilities.insert(
+            "notion.fetch".to_string(),
+            CapabilityMeta {
+                server: "notion".to_string(),
+                tool: "fetch".to_string(),
+                summary: "Fetch a notion page".to_string(),
+                description: "desc".to_string(),
+                input_schema: serde_json::json!({}),
+                tags: vec!["notion".to_string()],
+                examples: vec![],
+            },
+        );
+
+        let server = FacadeMcpServer {
+            state: AppState {
+                servers: Arc::new(HashMap::new()),
+                server_readiness: Arc::new(HashMap::new()),
+                capabilities: Arc::new(capabilities),
+                resources: Arc::new(HashMap::new()),
+                prompts: Arc::new(HashMap::new()),
+                tool_timeout_ms: 30_000,
+                policy: Policy::from_config(None),
+            },
+        };
+
+        let value = server
+            .list_capabilities_value(
+                Some("notion".to_string()),
+                Some("search".to_string()),
+                Some(1),
+            )
+            .await
+            .expect("capability list should succeed");
+        let capabilities = value["capabilities"]
+            .as_array()
+            .expect("capabilities array should exist");
+
+        assert_eq!(capabilities.len(), 1);
+        assert_eq!(capabilities[0]["id"], "notion.notion-search");
     }
 }

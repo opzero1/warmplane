@@ -766,8 +766,13 @@ async fn initialize_prepared_server(
     let mut capabilities = vec![];
     let mut resources = vec![];
     let mut prompts = vec![];
+    let (tools_result, resources_result, prompts_result) = tokio::join!(
+        mcp_client.list_tools(Default::default()),
+        mcp_client.list_resources(Default::default()),
+        mcp_client.list_prompts(Default::default()),
+    );
 
-    if let Ok(tools) = mcp_client.list_tools(Default::default()).await {
+    if let Ok(tools) = tools_result {
         if let Ok(tools_json) = serde_json::to_value(&tools) {
             if let Some(tools_array) = tools_json.get("tools").and_then(|t| t.as_array()) {
                 for tool in tools_array {
@@ -808,7 +813,7 @@ async fn initialize_prepared_server(
         }
     }
 
-    if let Ok(listed_resources) = mcp_client.list_resources(Default::default()).await {
+    if let Ok(listed_resources) = resources_result {
         if let Ok(resources_json) = serde_json::to_value(&listed_resources) {
             if let Some(resource_array) = resources_json.get("resources").and_then(|r| r.as_array())
             {
@@ -853,7 +858,7 @@ async fn initialize_prepared_server(
         }
     }
 
-    if let Ok(listed_prompts) = mcp_client.list_prompts(Default::default()).await {
+    if let Ok(listed_prompts) = prompts_result {
         if let Ok(prompts_json) = serde_json::to_value(&listed_prompts) {
             for prompt in prompt_items_from_value(&prompts_json) {
                 let Some(name) = prompt.get("name").and_then(|v| v.as_str()) else {
