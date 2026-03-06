@@ -18,10 +18,11 @@ use tokio::sync::oneshot;
 
 use crate::{
     config::McpConfig,
-    daemon::{initialize_state, AppState, ServerMsg, UpstreamCallError},
+    daemon::{initialize_state, AppState, CapabilityMeta, ServerMsg, UpstreamCallError},
 };
 
 const TOOL_CAPABILITIES_LIST: &str = "capabilities_list";
+const TOOL_CAPABILITY_FIND: &str = "capability_find";
 const TOOL_CAPABILITY_DESCRIBE: &str = "capability_describe";
 const TOOL_CAPABILITY_CALL: &str = "capability_call";
 const TOOL_RESOURCES_LIST: &str = "resources_list";
@@ -73,6 +74,24 @@ impl ServerHandler for FacadeMcpServer {
                 self.list_capabilities_value(
                     args.get("server").and_then(Value::as_str).map(ToString::to_string),
                     args.get("query").and_then(Value::as_str).map(ToString::to_string),
+                    args.get("limit").and_then(Value::as_u64),
+                )
+                .await
+            }
+            TOOL_CAPABILITY_FIND => {
+                let Some(server) = args.get("server").and_then(Value::as_str) else {
+                    return Ok(CallToolResult::structured_error(invalid_args(
+                        "Missing required field 'server'",
+                    )));
+                };
+                let Some(query) = args.get("query").and_then(Value::as_str) else {
+                    return Ok(CallToolResult::structured_error(invalid_args(
+                        "Missing required field 'query'",
+                    )));
+                };
+                self.find_capability_value(
+                    server.to_string(),
+                    query.to_string(),
                     args.get("limit").and_then(Value::as_u64),
                 )
                 .await
@@ -287,6 +306,79 @@ impl ServerHandler for FacadeMcpServer {
 }
 
 impl FacadeMcpServer {
+    fn capability_arg_fields(meta: &CapabilityMeta) -> (Vec<String>, Vec<String>) {
+        let Some(props) = meta
+            .input_schema
+            .get("properties")
+            .and_then(Value::as_object)
+        else {
+            return (vec![], vec![]);
+        };
+        let required: Vec<String> = meta
+            .input_schema
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|items: &Vec<Value>| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let optional = props
+            .keys()
+            .filter(|key| !required.iter().any(|item| item == key.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        (required, optional)
+    }
+
+    fn capability_score(id: &str, meta: &CapabilityMeta, query: &str) -> i32 {
+        let query = query.trim().to_lowercase();
+        if query.is_empty() {
+            return 0;
+        }
+        let id_l = id.to_lowercase();
+        let server_l = meta.server.to_lowercase();
+        let tool_l = meta.tool.to_lowercase();
+        let summary_l = meta.summary.to_lowercase();
+        let mut score = 0;
+        if id_l == query || tool_l == query {
+            score += 100;
+        }
+        if id_l.contains(&query) {
+            score += 50;
+        }
+        if tool_l.contains(&query) {
+            score += 40;
+        }
+        if summary_l.contains(&query) {
+            score += 20;
+        }
+
+        for token in query
+            .split(|char: char| !char.is_ascii_alphanumeric())
+            .filter(|token| !token.is_empty())
+        {
+            if server_l.contains(token) {
+                score += 8;
+            }
+            if tool_l.contains(token) {
+                score += 12;
+            }
+            if id_l.contains(token) {
+                score += 12;
+            }
+            if summary_l.contains(token) {
+                score += 6;
+            }
+        }
+
+        score
+    }
+
     async fn list_capabilities_value(
         &self,
         server: Option<String>,
@@ -366,6 +458,58 @@ impl FacadeMcpServer {
             "version": "v1",
             "capabilities": capabilities,
             "server_readiness": server_readiness,
+        }))
+    }
+
+    async fn find_capability_value(
+        &self,
+        server: String,
+        query: String,
+        limit: Option<u64>,
+    ) -> std::result::Result<Value, String> {
+        let server_l = server.to_lowercase();
+        let mut matches = self
+            .state
+            .capabilities
+            .iter()
+            .filter(|(_, meta)| meta.server.eq_ignore_ascii_case(&server_l))
+            .map(|(id, meta)| {
+                let score = Self::capability_score(id, meta, &query);
+                let (required_fields, optional_fields) = Self::capability_arg_fields(meta);
+                (
+                    score,
+                    json!({
+                        "id": id,
+                        "server": meta.server,
+                        "tool": meta.tool,
+                        "summary": meta.summary,
+                        "required_fields": required_fields,
+                        "optional_fields": optional_fields,
+                    }),
+                )
+            })
+            .filter(|(score, _)| *score > 0)
+            .collect::<Vec<_>>();
+
+        matches.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| {
+            left.1
+                .get("id")
+                .and_then(Value::as_str)
+                .cmp(&right.1.get("id").and_then(Value::as_str))
+        }));
+
+        let limit = limit.unwrap_or(8).clamp(1, 20) as usize;
+        let matches = matches
+            .into_iter()
+            .take(limit)
+            .map(|(_, value)| value)
+            .collect::<Vec<_>>();
+
+        Ok(json!({
+            "version": "v1",
+            "server": server,
+            "query": query,
+            "matches": matches,
         }))
     }
 
@@ -793,6 +937,20 @@ fn facade_tools() -> Vec<Tool> {
             })),
         ),
         Tool::new(
+            TOOL_CAPABILITY_FIND,
+            "Find the best capability matches inside one provider for a task; use this instead of broad discovery when the provider is known but the exact capability id is not",
+            schema_object(json!({
+                "type":"object",
+                "properties":{
+                    "server":{"type":"string"},
+                    "query":{"type":"string"},
+                    "limit":{"type":"integer","minimum":1,"maximum":20}
+                },
+                "required":["server","query"],
+                "additionalProperties":false
+            })),
+        ),
+        Tool::new(
             TOOL_CAPABILITY_DESCRIBE,
             "Fetch full schema and examples for one capability id; only use this when capabilities_list summary is not enough to build args",
             schema_object(json!({
@@ -904,8 +1062,9 @@ mod tests {
             .into_iter()
             .map(|t| t.name.to_string())
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 7);
+        assert_eq!(names.len(), 8);
         assert!(names.contains(&"capabilities_list".to_string()));
+        assert!(names.contains(&"capability_find".to_string()));
         assert!(names.contains(&"capability_describe".to_string()));
         assert!(names.contains(&"capability_call".to_string()));
         assert!(names.contains(&"resources_list".to_string()));
@@ -989,5 +1148,67 @@ mod tests {
 
         assert_eq!(capabilities.len(), 1);
         assert_eq!(capabilities[0]["id"], "notion.notion-search");
+    }
+
+    #[tokio::test]
+    async fn capability_find_returns_ranked_matches_with_arg_hints() {
+        let mut capabilities = HashMap::new();
+        capabilities.insert(
+            "linear.list_issues".to_string(),
+            CapabilityMeta {
+                server: "linear".to_string(),
+                tool: "list_issues".to_string(),
+                summary: "List issues with filters like assignee and state".to_string(),
+                description: "desc".to_string(),
+                input_schema: serde_json::json!({
+                    "type":"object",
+                    "properties":{
+                        "assignee":{"type":"string"},
+                        "state":{"type":"string"},
+                        "limit":{"type":"integer"}
+                    },
+                    "required":["assignee"]
+                }),
+                tags: vec!["linear".to_string()],
+                examples: vec![],
+            },
+        );
+        capabilities.insert(
+            "linear.list_users".to_string(),
+            CapabilityMeta {
+                server: "linear".to_string(),
+                tool: "list_users".to_string(),
+                summary: "List users".to_string(),
+                description: "desc".to_string(),
+                input_schema: serde_json::json!({"type":"object","properties":{}}),
+                tags: vec!["linear".to_string()],
+                examples: vec![],
+            },
+        );
+
+        let server = FacadeMcpServer {
+            state: AppState {
+                servers: Arc::new(HashMap::new()),
+                server_readiness: Arc::new(HashMap::new()),
+                capabilities: Arc::new(capabilities),
+                resources: Arc::new(HashMap::new()),
+                prompts: Arc::new(HashMap::new()),
+                tool_timeout_ms: 30_000,
+                policy: Policy::from_config(None),
+            },
+        };
+
+        let value = server
+            .find_capability_value(
+                "linear".to_string(),
+                "my in progress issues".to_string(),
+                Some(3),
+            )
+            .await
+            .expect("capability find should succeed");
+        let matches = value["matches"].as_array().expect("matches array should exist");
+
+        assert_eq!(matches[0]["id"], "linear.list_issues");
+        assert_eq!(matches[0]["required_fields"][0], "assignee");
     }
 }
