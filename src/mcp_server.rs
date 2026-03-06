@@ -1,21 +1,24 @@
-use std::{sync::Arc, sync::atomic::{AtomicU64, Ordering}};
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    sync::Arc,
+};
 
 use anyhow::Result;
 use rmcp::{
     model::{
-        CallToolRequestParams, CallToolResult, Content, GetPromptRequestParams, GetPromptResult,
-        ListResourcesResult, ListToolsResult, Prompt, ReadResourceRequestParams, ReadResourceResult,
-        RawResource, ServerCapabilities, ServerInfo, Tool, AnnotateAble,
+        AnnotateAble, CallToolRequestParams, CallToolResult, Content, GetPromptRequestParams,
+        GetPromptResult, ListResourcesResult, ListToolsResult, Prompt, RawResource,
+        ReadResourceRequestParams, ReadResourceResult, ServerCapabilities, ServerInfo, Tool,
     },
-    ErrorData as McpError, ServerHandler, ServiceExt,
     transport::stdio,
+    ErrorData as McpError, ServerHandler, ServiceExt,
 };
 use serde_json::{json, Map, Value};
 use tokio::sync::oneshot;
 
 use crate::{
     config::McpConfig,
-    daemon::{AppState, ServerMsg, UpstreamCallError, initialize_state},
+    daemon::{initialize_state, AppState, ServerMsg, UpstreamCallError},
 };
 
 const TOOL_CAPABILITIES_LIST: &str = "capabilities_list";
@@ -69,19 +72,27 @@ impl ServerHandler for FacadeMcpServer {
             TOOL_CAPABILITIES_LIST => self.list_capabilities_value().await,
             TOOL_CAPABILITY_DESCRIBE => {
                 let Some(id) = args.get("id").and_then(Value::as_str) else {
-                    return Ok(CallToolResult::structured_error(invalid_args("Missing required field 'id'")));
+                    return Ok(CallToolResult::structured_error(invalid_args(
+                        "Missing required field 'id'",
+                    )));
                 };
                 self.describe_capability_value(id.to_string()).await
             }
             TOOL_CAPABILITY_CALL => {
                 let Some(capability_id) = args.get("capability_id").and_then(Value::as_str) else {
-                    return Ok(CallToolResult::structured_error(invalid_args("Missing required field 'capability_id'")));
+                    return Ok(CallToolResult::structured_error(invalid_args(
+                        "Missing required field 'capability_id'",
+                    )));
                 };
                 let Some(call_args) = args.get("args") else {
-                    return Ok(CallToolResult::structured_error(invalid_args("Missing required field 'args'")));
+                    return Ok(CallToolResult::structured_error(invalid_args(
+                        "Missing required field 'args'",
+                    )));
                 };
                 if !call_args.is_object() {
-                    return Ok(CallToolResult::structured_error(invalid_args("'args' must be a JSON object")));
+                    return Ok(CallToolResult::structured_error(invalid_args(
+                        "'args' must be a JSON object",
+                    )));
                 }
                 let request_id = args
                     .get("request_id")
@@ -93,25 +104,31 @@ impl ServerHandler for FacadeMcpServer {
             TOOL_RESOURCES_LIST => self.list_resources_value().await,
             TOOL_RESOURCE_READ => {
                 let Some(resource_id) = args.get("resource_id").and_then(Value::as_str) else {
-                    return Ok(CallToolResult::structured_error(invalid_args("Missing required field 'resource_id'")));
+                    return Ok(CallToolResult::structured_error(invalid_args(
+                        "Missing required field 'resource_id'",
+                    )));
                 };
                 let request_id = args
                     .get("request_id")
                     .and_then(Value::as_str)
                     .map(ToString::to_string);
-                self.read_resource_value(resource_id.to_string(), request_id).await
+                self.read_resource_value(resource_id.to_string(), request_id)
+                    .await
             }
             TOOL_PROMPTS_LIST => self.list_prompts_value().await,
             TOOL_PROMPT_GET => {
                 let Some(prompt_id) = args.get("prompt_id").and_then(Value::as_str) else {
-                    return Ok(CallToolResult::structured_error(invalid_args("Missing required field 'prompt_id'")));
+                    return Ok(CallToolResult::structured_error(invalid_args(
+                        "Missing required field 'prompt_id'",
+                    )));
                 };
                 let request_id = args
                     .get("request_id")
                     .and_then(Value::as_str)
                     .map(ToString::to_string);
                 let arguments = args.get("arguments").cloned();
-                self.get_prompt_value(prompt_id.to_string(), arguments, request_id).await
+                self.get_prompt_value(prompt_id.to_string(), arguments, request_id)
+                    .await
             }
             _ => {
                 return Err(McpError::invalid_params(
@@ -185,8 +202,9 @@ impl ServerHandler for FacadeMcpServer {
         .map_err(|_| McpError::internal_error("Server mailbox closed", None))?;
 
         match reply_rx.await {
-            Ok(Ok(value)) => serde_json::from_value(value)
-                .map_err(|e| McpError::internal_error(format!("Invalid resource payload: {e}"), None)),
+            Ok(Ok(value)) => serde_json::from_value(value).map_err(|e| {
+                McpError::internal_error(format!("Invalid resource payload: {e}"), None)
+            }),
             Ok(Err(UpstreamCallError::Timeout)) => {
                 Err(McpError::internal_error("Resource read timed out", None))
             }
@@ -249,8 +267,9 @@ impl ServerHandler for FacadeMcpServer {
         .map_err(|_| McpError::internal_error("Server mailbox closed", None))?;
 
         match reply_rx.await {
-            Ok(Ok(value)) => serde_json::from_value(value)
-                .map_err(|e| McpError::internal_error(format!("Invalid prompt payload: {e}"), None)),
+            Ok(Ok(value)) => serde_json::from_value(value).map_err(|e| {
+                McpError::internal_error(format!("Invalid prompt payload: {e}"), None)
+            }),
             Ok(Err(UpstreamCallError::Timeout)) => {
                 Err(McpError::internal_error("Prompt get timed out", None))
             }
@@ -276,16 +295,35 @@ impl FacadeMcpServer {
                 })
             })
             .collect::<Vec<_>>();
+        let mut server_readiness = self
+            .state
+            .server_readiness
+            .iter()
+            .map(|(server, readiness)| {
+                json!({
+                    "server": server,
+                    "code": readiness.code,
+                    "message": readiness.message,
+                    "retryable": readiness.retryable,
+                })
+            })
+            .collect::<Vec<_>>();
 
         capabilities.sort_by(|a, b| {
             a.get("id")
                 .and_then(|v| v.as_str())
                 .cmp(&b.get("id").and_then(|v| v.as_str()))
         });
+        server_readiness.sort_by(|a, b| {
+            a.get("server")
+                .and_then(|v| v.as_str())
+                .cmp(&b.get("server").and_then(|v| v.as_str()))
+        });
 
         Ok(json!({
             "version": "v1",
             "capabilities": capabilities,
+            "server_readiness": server_readiness,
         }))
     }
 
@@ -417,16 +455,35 @@ impl FacadeMcpServer {
                 })
             })
             .collect::<Vec<_>>();
+        let mut server_readiness = self
+            .state
+            .server_readiness
+            .iter()
+            .map(|(server, readiness)| {
+                json!({
+                    "server": server,
+                    "code": readiness.code,
+                    "message": readiness.message,
+                    "retryable": readiness.retryable,
+                })
+            })
+            .collect::<Vec<_>>();
 
         resources.sort_by(|a, b| {
             a.get("id")
                 .and_then(|v| v.as_str())
                 .cmp(&b.get("id").and_then(|v| v.as_str()))
         });
+        server_readiness.sort_by(|a, b| {
+            a.get("server")
+                .and_then(|v| v.as_str())
+                .cmp(&b.get("server").and_then(|v| v.as_str()))
+        });
 
         Ok(json!({
             "version": "v1",
             "resources": resources,
+            "server_readiness": server_readiness,
         }))
     }
 
@@ -496,7 +553,10 @@ impl FacadeMcpServer {
                 trace_id,
                 request_id,
                 "UPSTREAM_TIMEOUT",
-                format!("Resource read timed out after {}ms", self.state.tool_timeout_ms),
+                format!(
+                    "Resource read timed out after {}ms",
+                    self.state.tool_timeout_ms
+                ),
                 true,
             )),
             Ok(Err(UpstreamCallError::Upstream(err))) => Ok(error_envelope(
@@ -533,16 +593,35 @@ impl FacadeMcpServer {
                 })
             })
             .collect::<Vec<_>>();
+        let mut server_readiness = self
+            .state
+            .server_readiness
+            .iter()
+            .map(|(server, readiness)| {
+                json!({
+                    "server": server,
+                    "code": readiness.code,
+                    "message": readiness.message,
+                    "retryable": readiness.retryable,
+                })
+            })
+            .collect::<Vec<_>>();
 
         prompts.sort_by(|a, b| {
             a.get("id")
                 .and_then(|v| v.as_str())
                 .cmp(&b.get("id").and_then(|v| v.as_str()))
         });
+        server_readiness.sort_by(|a, b| {
+            a.get("server")
+                .and_then(|v| v.as_str())
+                .cmp(&b.get("server").and_then(|v| v.as_str()))
+        });
 
         Ok(json!({
             "version": "v1",
             "prompts": prompts,
+            "server_readiness": server_readiness,
         }))
     }
 
@@ -628,7 +707,10 @@ impl FacadeMcpServer {
                 trace_id,
                 request_id,
                 "UPSTREAM_TIMEOUT",
-                format!("Prompt get timed out after {}ms", self.state.tool_timeout_ms),
+                format!(
+                    "Prompt get timed out after {}ms",
+                    self.state.tool_timeout_ms
+                ),
                 true,
             )),
             Ok(Err(UpstreamCallError::Upstream(err))) => Ok(error_envelope(
@@ -650,13 +732,7 @@ impl FacadeMcpServer {
 }
 
 fn invalid_args(message: impl Into<String>) -> Value {
-    error_envelope(
-        next_trace_id(),
-        None,
-        "INVALID_ARGS",
-        message.into(),
-        false,
-    )
+    error_envelope(next_trace_id(), None, "INVALID_ARGS", message.into(), false)
 }
 
 fn facade_tools() -> Vec<Tool> {

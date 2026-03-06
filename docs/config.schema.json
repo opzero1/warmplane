@@ -7,6 +7,7 @@
   "properties": {
     "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
     "toolTimeoutMs": { "type": "integer", "minimum": 1 },
+    "authStorePath": { "type": "string" },
     "capabilityAliases": {
       "type": "object",
       "additionalProperties": { "type": "string" }
@@ -42,7 +43,6 @@
     },
     "mcpServers": {
       "type": "object",
-      "minProperties": 1,
       "additionalProperties": {
         "$ref": "#/$defs/serverConfig"
       }
@@ -92,6 +92,21 @@
                 "username": { "type": "string" },
                 "password": { "type": "string" },
                 "passwordEnv": { "type": "string" }
+              },
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "required": ["type"],
+              "properties": {
+                "type": { "const": "oauth" },
+                "clientId": { "type": "string" },
+                "clientName": { "type": "string" },
+                "clientSecret": { "type": "string" },
+                "clientSecretEnv": { "type": "string" },
+                "redirectUri": { "type": "string", "format": "uri" },
+                "scope": { "type": "string" },
+                "tokenStoreKey": { "type": "string" }
               },
               "additionalProperties": false
             }

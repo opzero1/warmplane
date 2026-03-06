@@ -12,6 +12,8 @@ pub struct McpConfig {
     pub port: Option<u16>,
     #[serde(default, rename = "toolTimeoutMs")]
     pub tool_timeout_ms: Option<u64>,
+    #[serde(default, rename = "authStorePath")]
+    pub auth_store_path: Option<String>,
     #[serde(default, rename = "capabilityAliases")]
     pub capability_aliases: HashMap<String, String>,
     #[serde(default, rename = "resourceAliases")]
@@ -47,18 +49,49 @@ pub struct ServerConfig {
 #[derive(Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AuthConfig {
+    #[serde(rename = "bearer")]
     Bearer {
         #[serde(default)]
         token: Option<String>,
         #[serde(default, rename = "tokenEnv")]
         token_env: Option<String>,
     },
+    #[serde(rename = "basic")]
     Basic {
         username: String,
         #[serde(default)]
         password: Option<String>,
         #[serde(default, rename = "passwordEnv")]
         password_env: Option<String>,
+    },
+    #[serde(rename = "oauth")]
+    OAuth {
+        #[serde(default, rename = "clientId")]
+        client_id: Option<String>,
+        #[serde(default, rename = "clientName")]
+        client_name: Option<String>,
+        #[serde(default, rename = "clientSecret")]
+        client_secret: Option<String>,
+        #[serde(default, rename = "clientSecretEnv")]
+        client_secret_env: Option<String>,
+        #[serde(default, rename = "redirectUri")]
+        redirect_uri: Option<String>,
+        #[serde(default)]
+        scope: Option<String>,
+        #[serde(default, rename = "tokenStoreKey")]
+        token_store_key: Option<String>,
+        #[serde(default, rename = "authorizationServer")]
+        authorization_server: Option<String>,
+        #[serde(default, rename = "resourceMetadataUrl")]
+        resource_metadata_url: Option<String>,
+        #[serde(default, rename = "authorizationEndpoint")]
+        authorization_endpoint: Option<String>,
+        #[serde(default, rename = "tokenEndpoint")]
+        token_endpoint: Option<String>,
+        #[serde(default, rename = "registrationEndpoint")]
+        registration_endpoint: Option<String>,
+        #[serde(default, rename = "codeChallengeMethodsSupported")]
+        code_challenge_methods_supported: Vec<String>,
     },
 }
 
@@ -94,7 +127,9 @@ pub fn resolve_client_port(port_override: Option<u16>, config_path: &str) -> Res
             Ok(config.port.unwrap_or(DEFAULT_PORT))
         }
         Err(err) if err.kind() == ErrorKind::NotFound => Ok(DEFAULT_PORT),
-        Err(err) => Err(err).with_context(|| format!("Failed to read config file: {}", config_path)),
+        Err(err) => {
+            Err(err).with_context(|| format!("Failed to read config file: {}", config_path))
+        }
     }
 }
 
@@ -192,6 +227,117 @@ fn validate_config(config: &McpConfig) -> Result<()> {
                         );
                     }
                 }
+                AuthConfig::OAuth {
+                    client_id,
+                    client_name,
+                    client_secret,
+                    client_secret_env,
+                    redirect_uri,
+                    scope,
+                    token_store_key,
+                    authorization_server,
+                    resource_metadata_url,
+                    authorization_endpoint,
+                    token_endpoint,
+                    registration_endpoint,
+                    code_challenge_methods_supported,
+                } => {
+                    if client_id
+                        .as_ref()
+                        .map(|value| value.trim().is_empty())
+                        .unwrap_or(false)
+                    {
+                        anyhow::bail!(
+                            "Server '{}' oauth auth requires non-empty 'clientId' when provided",
+                            server_id
+                        );
+                    }
+
+                    if client_name
+                        .as_ref()
+                        .map(|value| value.trim().is_empty())
+                        .unwrap_or(false)
+                    {
+                        anyhow::bail!(
+                            "Server '{}' oauth auth requires non-empty 'clientName' when provided",
+                            server_id
+                        );
+                    }
+
+                    let has_client_secret = client_secret
+                        .as_ref()
+                        .map(|value| !value.is_empty())
+                        .unwrap_or(false);
+                    let has_client_secret_env = client_secret_env
+                        .as_ref()
+                        .map(|value| !value.trim().is_empty())
+                        .unwrap_or(false);
+                    if has_client_secret && has_client_secret_env {
+                        anyhow::bail!(
+                            "Server '{}' oauth auth cannot define both 'clientSecret' and 'clientSecretEnv'",
+                            server_id
+                        );
+                    }
+
+                    if redirect_uri
+                        .as_ref()
+                        .map(|value| value.trim().is_empty())
+                        .unwrap_or(false)
+                    {
+                        anyhow::bail!(
+                            "Server '{}' oauth auth requires non-empty 'redirectUri' when provided",
+                            server_id
+                        );
+                    }
+
+                    if scope
+                        .as_ref()
+                        .map(|value| value.trim().is_empty())
+                        .unwrap_or(false)
+                    {
+                        anyhow::bail!(
+                            "Server '{}' oauth auth requires non-empty 'scope' when provided",
+                            server_id
+                        );
+                    }
+
+                    if token_store_key
+                        .as_ref()
+                        .map(|value| value.trim().is_empty())
+                        .unwrap_or(false)
+                    {
+                        anyhow::bail!(
+                            "Server '{}' oauth auth requires non-empty 'tokenStoreKey' when provided",
+                            server_id
+                        );
+                    }
+
+                    for (field_name, value) in [
+                        ("authorizationServer", authorization_server.as_ref()),
+                        ("resourceMetadataUrl", resource_metadata_url.as_ref()),
+                        ("authorizationEndpoint", authorization_endpoint.as_ref()),
+                        ("tokenEndpoint", token_endpoint.as_ref()),
+                        ("registrationEndpoint", registration_endpoint.as_ref()),
+                    ] {
+                        if value.map(|value| value.trim().is_empty()).unwrap_or(false) {
+                            anyhow::bail!(
+                                "Server '{}' oauth auth requires non-empty '{}' when provided",
+                                server_id,
+                                field_name
+                            );
+                        }
+                    }
+
+                    if code_challenge_methods_supported
+                        .iter()
+                        .any(|value| value.trim().is_empty())
+                    {
+                        anyhow::bail!(
+                            "Server '{}' oauth auth requires non-empty values in 'codeChallengeMethodsSupported'",
+                            server_id
+                        );
+                    }
+                }
             }
         }
     }
@@ -200,7 +346,7 @@ fn validate_config(config: &McpConfig) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthConfig, McpConfig, ServerConfig, validate_config};
+    use super::{validate_config, AuthConfig, McpConfig, ServerConfig};
     use std::collections::HashMap;
 
     fn empty_server() -> ServerConfig {
@@ -222,6 +368,7 @@ mod tests {
         McpConfig {
             port: None,
             tool_timeout_ms: None,
+            auth_store_path: None,
             capability_aliases: HashMap::new(),
             resource_aliases: HashMap::new(),
             prompt_aliases: HashMap::new(),
@@ -296,5 +443,71 @@ mod tests {
             token_env: Some("MCP_TOKEN".to_string()),
         });
         assert!(validate_config(&config_with_server(server)).is_ok());
+    }
+
+    #[test]
+    fn oauth_server_passes_validation_without_client_id() {
+        let mut server = empty_server();
+        server.url = Some("https://example.com/mcp".to_string());
+        server.auth = Some(AuthConfig::OAuth {
+            client_id: None,
+            client_name: None,
+            client_secret: None,
+            client_secret_env: None,
+            redirect_uri: None,
+            scope: Some("files:read".to_string()),
+            token_store_key: None,
+            authorization_server: None,
+            resource_metadata_url: None,
+            authorization_endpoint: None,
+            token_endpoint: None,
+            registration_endpoint: None,
+            code_challenge_methods_supported: vec![],
+        });
+        assert!(validate_config(&config_with_server(server)).is_ok());
+    }
+
+    #[test]
+    fn oauth_server_rejects_duplicate_client_secret_sources() {
+        let mut server = empty_server();
+        server.url = Some("https://example.com/mcp".to_string());
+        server.auth = Some(AuthConfig::OAuth {
+            client_id: Some("client-id".to_string()),
+            client_name: None,
+            client_secret: Some("secret".to_string()),
+            client_secret_env: Some("CLIENT_SECRET".to_string()),
+            redirect_uri: None,
+            scope: None,
+            token_store_key: None,
+            authorization_server: None,
+            resource_metadata_url: None,
+            authorization_endpoint: None,
+            token_endpoint: None,
+            registration_endpoint: None,
+            code_challenge_methods_supported: vec![],
+        });
+        let err = validate_config(&config_with_server(server)).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("cannot define both 'clientSecret' and 'clientSecretEnv'"));
+    }
+
+    #[test]
+    fn oauth_json_tag_accepts_oauth_literal() {
+        let parsed: AuthConfig = serde_json::from_str(
+            r#"{
+                "type": "oauth",
+                "tokenStoreKey": "figma"
+            }"#,
+        )
+        .expect("oauth auth tag should parse");
+
+        assert!(matches!(
+            parsed,
+            AuthConfig::OAuth {
+                token_store_key: Some(_),
+                ..
+            }
+        ));
     }
 }

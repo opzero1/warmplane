@@ -52,16 +52,34 @@ pub async fn handle_list_capabilities(State(state): State<AppState>) -> Json<Val
             })
         })
         .collect::<Vec<_>>();
+    let mut server_readiness = state
+        .server_readiness
+        .iter()
+        .map(|(server, readiness)| {
+            json!({
+                "server": server,
+                "code": readiness.code,
+                "message": readiness.message,
+                "retryable": readiness.retryable,
+            })
+        })
+        .collect::<Vec<_>>();
 
     capabilities.sort_by(|a, b| {
         a.get("id")
             .and_then(|v| v.as_str())
             .cmp(&b.get("id").and_then(|v| v.as_str()))
     });
+    server_readiness.sort_by(|a, b| {
+        a.get("server")
+            .and_then(|v| v.as_str())
+            .cmp(&b.get("server").and_then(|v| v.as_str()))
+    });
 
     Json(json!({
         "version": "v1",
         "capabilities": capabilities,
+        "server_readiness": server_readiness,
     }))
 }
 
@@ -123,16 +141,34 @@ pub async fn handle_list_resources(State(state): State<AppState>) -> Json<Value>
             })
         })
         .collect::<Vec<_>>();
+    let mut server_readiness = state
+        .server_readiness
+        .iter()
+        .map(|(server, readiness)| {
+            json!({
+                "server": server,
+                "code": readiness.code,
+                "message": readiness.message,
+                "retryable": readiness.retryable,
+            })
+        })
+        .collect::<Vec<_>>();
 
     resources.sort_by(|a, b| {
         a.get("id")
             .and_then(|v| v.as_str())
             .cmp(&b.get("id").and_then(|v| v.as_str()))
     });
+    server_readiness.sort_by(|a, b| {
+        a.get("server")
+            .and_then(|v| v.as_str())
+            .cmp(&b.get("server").and_then(|v| v.as_str()))
+    });
 
     Json(json!({
         "version": "v1",
         "resources": resources,
+        "server_readiness": server_readiness,
     }))
 }
 
@@ -152,16 +188,34 @@ pub async fn handle_list_prompts(State(state): State<AppState>) -> Json<Value> {
             })
         })
         .collect::<Vec<_>>();
+    let mut server_readiness = state
+        .server_readiness
+        .iter()
+        .map(|(server, readiness)| {
+            json!({
+                "server": server,
+                "code": readiness.code,
+                "message": readiness.message,
+                "retryable": readiness.retryable,
+            })
+        })
+        .collect::<Vec<_>>();
 
     prompts.sort_by(|a, b| {
         a.get("id")
             .and_then(|v| v.as_str())
             .cmp(&b.get("id").and_then(|v| v.as_str()))
     });
+    server_readiness.sort_by(|a, b| {
+        a.get("server")
+            .and_then(|v| v.as_str())
+            .cmp(&b.get("server").and_then(|v| v.as_str()))
+    });
 
     Json(json!({
         "version": "v1",
         "prompts": prompts,
+        "server_readiness": server_readiness,
     }))
 }
 
@@ -367,8 +421,10 @@ pub async fn handle_get_prompt(
     };
 
     let request_id = payload.request_id;
-    let redacted_input =
-        redact_value(serde_json::to_value(&arguments).unwrap_or(Value::Null), &state.policy.redact_keys);
+    let redacted_input = redact_value(
+        serde_json::to_value(&arguments).unwrap_or(Value::Null),
+        &state.policy.redact_keys,
+    );
     info!(
         trace_id = %trace_id,
         prompt_id = %payload.prompt_id,
@@ -482,10 +538,7 @@ pub async fn handle_call_capability(
                 trace_id,
                 payload.request_id,
                 "INVALID_ARGS",
-                format!(
-                    "Capability '{}' blocked by policy",
-                    payload.capability_id
-                ),
+                format!("Capability '{}' blocked by policy", payload.capability_id),
                 false,
             )),
         )
@@ -663,13 +716,7 @@ mod tests {
         redact_value, AppState, GetPromptRequest, ReadResourceRequest,
     };
     use crate::daemon::{Policy, PromptMeta, ResourceMeta};
-    use axum::{
-        body::to_bytes,
-        extract::State,
-        http::StatusCode,
-        response::IntoResponse,
-        Json,
-    };
+    use axum::{body::to_bytes, extract::State, http::StatusCode, response::IntoResponse, Json};
     use serde_json::{json, Value};
     use std::{collections::HashMap, sync::Arc};
     use tokio::sync::mpsc;
@@ -719,6 +766,7 @@ mod tests {
 
         let state = AppState {
             servers: Arc::new(HashMap::new()),
+            server_readiness: Arc::new(HashMap::new()),
             capabilities: Arc::new(HashMap::new()),
             resources: Arc::new(resources),
             prompts: Arc::new(HashMap::new()),
@@ -740,6 +788,7 @@ mod tests {
     async fn read_resource_returns_not_found_code() {
         let state = AppState {
             servers: Arc::new(HashMap::new()),
+            server_readiness: Arc::new(HashMap::new()),
             capabilities: Arc::new(HashMap::new()),
             resources: Arc::new(HashMap::new()),
             prompts: Arc::new(HashMap::new()),
@@ -793,6 +842,7 @@ mod tests {
 
         let state = AppState {
             servers: Arc::new(HashMap::new()),
+            server_readiness: Arc::new(HashMap::new()),
             capabilities: Arc::new(HashMap::new()),
             resources: Arc::new(HashMap::new()),
             prompts: Arc::new(prompts),
@@ -814,6 +864,7 @@ mod tests {
     async fn get_prompt_returns_not_found_code() {
         let state = AppState {
             servers: Arc::new(HashMap::new()),
+            server_readiness: Arc::new(HashMap::new()),
             capabilities: Arc::new(HashMap::new()),
             resources: Arc::new(HashMap::new()),
             prompts: Arc::new(HashMap::new()),
@@ -861,6 +912,7 @@ mod tests {
 
         let state = AppState {
             servers: Arc::new(servers),
+            server_readiness: Arc::new(HashMap::new()),
             capabilities: Arc::new(HashMap::new()),
             resources: Arc::new(HashMap::new()),
             prompts: Arc::new(prompts),

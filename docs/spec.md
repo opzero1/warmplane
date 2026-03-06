@@ -63,6 +63,7 @@ Also exposed natively via MCP methods:
 
 Configured in `mcp_servers.json`:
 
+- `authStorePath`: optional shared MCP auth-store path override
 - `capabilityAliases`: `<server>.<tool>` -> capability ID
 - `resourceAliases`: `<server>.<resource-uri>` -> resource ID
 - `promptAliases`: `<server>.<prompt-name>` -> prompt ID
@@ -93,5 +94,14 @@ If both or neither are present, startup fails with config validation errors.
 - `auth` (optional):
   - bearer: `{ "type": "bearer", "token" | "tokenEnv" }`
   - basic: `{ "type": "basic", "username", "password" | "passwordEnv" }`
+  - oauth: `{ "type": "oauth", "clientId"?, "clientSecret" | "clientSecretEnv"?, "scope"?, "tokenStoreKey"? }`
 
 For bearer/basic auth, exactly one secret source must be set.
+
+For oauth auth, Warmplane reads the shared `mcp-auth.json` store and injects the stored upstream bearer token into outbound HTTP requests.
+
+## Auth Store Commands
+
+- `warmplane auth status --config mcp_servers.json`
+- `warmplane auth import --config mcp_servers.json --server <id> --access-token-env <ENV>`
+- `warmplane auth logout --config mcp_servers.json --server <id>`

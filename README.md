@@ -76,6 +76,7 @@ Create `mcp_servers.json`:
 {
   "port": 9090,
   "toolTimeoutMs": 15000,
+  "authStorePath": "/Users/you/.local/share/opencode/mcp-auth.json",
   "capabilityAliases": {
     "sqlite.read_query": "db.query"
   },
@@ -107,6 +108,14 @@ Create `mcp_servers.json`:
         "tokenEnv": "REMOTE_DOCS_MCP_TOKEN"
       }
     },
+    "figma": {
+      "url": "https://mcp.figma.com/mcp",
+      "auth": {
+        "type": "oauth",
+        "scope": "file_content:read",
+        "tokenStoreKey": "figma"
+      }
+    },
     "filesystem": {
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
@@ -122,6 +131,8 @@ Per `mcpServers.<id>`, transport selection is strict and inferred:
 - exactly one of `command` or `url` must be set
 
 No legacy config fallback is supported.
+
+`authStorePath` is optional. When omitted, Warmplane reads and writes the shared MCP auth store at the existing OpenCode locations, preferring `~/.local/share/opencode/mcp-auth.json` and falling back to `~/.config/opencode/mcp-auth.json`.
 
 ### HTTP Auth
 
@@ -145,6 +156,122 @@ No legacy config fallback is supported.
 ```
 
 For bearer/basic, exactly one direct secret (`token`/`password`) or env-backed secret (`tokenEnv`/`passwordEnv`) is required.
+
+`auth.type = "oauth"`:
+
+```json
+{
+  "type": "oauth",
+  "clientId": "optional-pre-registered-client-id",
+  "clientName": "warmplane",
+  "clientSecretEnv": "MCP_CLIENT_SECRET",
+  "redirectUri": "http://127.0.0.1:8788/callback",
+  "scope": "files:read files:write",
+  "tokenStoreKey": "figma",
+  "authorizationEndpoint": "https://linear.app/oauth/authorize",
+  "tokenEndpoint": "https://api.linear.app/oauth/token",
+  "codeChallengeMethodsSupported": ["S256"]
+}
+```
+
+Warmplane currently uses the shared `mcp-auth.json` store for OAuth-backed upstream bearer injection. Manage those entries with the auth commands below.
+
+OAuth contract notes:
+
+- `clientId` is optional when the upstream authorization server supports dynamic client registration; `auth start` / `auth login` can register a client first and persist the returned `clientInfo` in the shared auth store.
+- `clientName` is optional and defaults to `warmplane` during dynamic registration.
+- `redirectUri` is optional and defaults to `http://127.0.0.1:8788/callback` for loopback callback handling.
+- `clientSecret` and `clientSecretEnv` remain mutually exclusive.
+- `tokenStoreKey` controls which shared auth-store entry Warmplane reads and writes.
+- Discovery metadata (`resourceMetadataUrl`, authorization server metadata, registration/token endpoints, PKCE support) is persisted in the shared auth store after `auth discover`.
+- For providers that do not expose RFC 9728 / RFC 8414 discovery metadata, you can preconfigure `authorizationEndpoint`, `tokenEndpoint`, optional `registrationEndpoint`, and `codeChallengeMethodsSupported` as explicit fallback metadata.
+
+## Auth Commands
+
+Discover upstream OAuth metadata before importing tokens:
+
+```bash
+warmplane auth discover --config mcp_servers.json --server figma
+```
+
+This resolves protected-resource and authorization-server metadata, then persists the normalized discovery record in the shared auth store so later status checks can show whether discovery has already succeeded.
+
+Build a PKCE authorization URL and persist `state`/`codeVerifier` in the shared auth store:
+
+```bash
+warmplane auth start --config mcp_servers.json --server figma
+```
+
+Run the integrated login flow with best-effort browser launch plus loopback callback capture:
+
+```bash
+warmplane auth login --config mcp_servers.json --server figma
+```
+
+Exchange the callback `code` and `state` using the stored PKCE verifier:
+
+```bash
+warmplane auth exchange --config mcp_servers.json --server figma --code <CODE> --state <STATE>
+```
+
+Inspect upstream OAuth readiness:
+
+```bash
+warmplane auth status --config mcp_servers.json
+```
+
+Import tokens into the shared auth store without editing JSON by hand:
+
+```bash
+warmplane auth import --config mcp_servers.json --server figma --access-token-env FIGMA_ACCESS_TOKEN --refresh-token-env FIGMA_REFRESH_TOKEN
+```
+
+Refresh stored OAuth credentials using the discovered token endpoint and refresh token:
+
+```bash
+warmplane auth refresh --config mcp_servers.json --server figma
+```
+
+Remove stored credentials for one upstream:
+
+```bash
+warmplane auth logout --config mcp_servers.json --server figma
+```
+
+## OAuth Operator Workflow
+
+Recommended bootstrap flow for a new OAuth-capable upstream:
+
+1. `warmplane auth discover --config mcp_servers.json --server <server>`
+2. `warmplane auth login --config mcp_servers.json --server <server>`
+3. `warmplane auth status --config mcp_servers.json --server <server>`
+
+Fallback/manual flow when browser automation or callback capture is not convenient:
+
+1. `warmplane auth discover --config mcp_servers.json --server <server>`
+2. `warmplane auth start --config mcp_servers.json --server <server>`
+3. Complete the browser flow yourself and capture the callback `code` + `state`
+4. `warmplane auth exchange --config mcp_servers.json --server <server> --code <CODE> --state <STATE>`
+5. `warmplane auth status --config mcp_servers.json --server <server>`
+
+Recovery and cleanup:
+
+- `warmplane auth refresh --config mcp_servers.json --server <server>` to rotate expired credentials manually
+- `warmplane auth logout --config mcp_servers.json --server <server>` to remove stored state and tokens
+- `warmplane validate-config --config mcp_servers.json` before retrying if auth bootstrap behaves unexpectedly
+
+Troubleshooting and rollback diagnostics:
+
+- `warmplane auth status --config mcp_servers.json --server <server>` to inspect discovery readiness, client readiness, refresh-token availability, and auth status
+- `warmplane auth logout --config mcp_servers.json --server <server>` followed by `warmplane auth login --config mcp_servers.json --server <server>` to recover from bad or stale local auth state
+- Remove or restore the shared `mcp-auth.json` entry for the affected `tokenStoreKey` if you need to roll back to a clean pre-auth state
+
+## Provider Compatibility Notes
+
+- Figma is the standards-first target: discovery, dynamic client registration, PKCE `S256`, token exchange, and refresh all align with Warmplane's native flow.
+- Linear is supported natively with explicit fallback metadata in config because its OAuth endpoints are documented but not published through the well-known discovery chain.
+- Notion remains a compatibility exception until live validation confirms PKCE and loopback redirect support for its MCP path. Treat it as an explicit shim case instead of silently assuming standards parity.
+- If an upstream does not advertise PKCE `S256`, does not expose the expected discovery metadata, or requires non-standard redirect handling, treat that as an explicit compatibility gap rather than silently falling back to wrapper behavior.
 
 ## Run Modes
 
@@ -258,12 +385,13 @@ Operational notes:
 - `trace_id` in execution envelopes can be correlated with logs and distributed traces.
 - When OTEL is enabled, traces are exported via OTLP gRPC and local structured logs remain active.
 
-For detailed request/response contracts, see [docs/spec.md](/Users/origo/src/mcp-fast-cli/docs/spec.md).
+For detailed request/response contracts, see [docs/spec.md](docs/spec.md).
 
 Additional references:
 
-- OpenAPI: [openapi.yaml](/Users/origo/src/mcp-fast-cli/docs/openapi.yaml)
-- Config schema: [config.schema.json](/Users/origo/src/mcp-fast-cli/docs/config.schema.json)
-- Install/distribution: [INSTALL.md](/Users/origo/src/mcp-fast-cli/docs/INSTALL.md)
-- Deployment runbook: [DEPLOYMENT.md](/Users/origo/src/mcp-fast-cli/docs/DEPLOYMENT.md)
-- Observability: [OBSERVABILITY.md](/Users/origo/src/mcp-fast-cli/docs/OBSERVABILITY.md)
+- OpenAPI: `docs/openapi.yaml`
+- Config schema: `docs/config.schema.json`
+- Install/distribution: `docs/INSTALL.md`
+- Deployment runbook: `docs/DEPLOYMENT.md`
+- Observability: `docs/OBSERVABILITY.md`
+- Rollout follow-ups: `docs/MCP0_FOLLOW_UPS.md`
