@@ -112,7 +112,10 @@ jobs:
 
       - name: Generate checksums
         working-directory: release-dist
-        run: sha256sum *.tar.gz warmplane-*-apple-darwin > checksums.txt
+        run: |
+          find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name 'warmplane-*-apple-darwin' \) -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > checksums.txt
 
       - name: Publish release assets
         uses: softprops/action-gh-release@v2
