@@ -84,11 +84,17 @@ jobs:
 
           tar -C dist -czf "dist/${name}.tar.gz" "$name"
 
+          if [[ "${{ matrix.target }}" == "aarch64-apple-darwin" || "${{ matrix.target }}" == "x86_64-apple-darwin" ]]; then
+            cp "target/${{ matrix.target }}/release/warmplane" "dist/warmplane-${{ matrix.target }}"
+          fi
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: warmplane-${{ matrix.target }}
-          path: dist/*.tar.gz
+          path: |
+            dist/*.tar.gz
+            dist/warmplane-*-apple-darwin
           if-no-files-found: error
 
   release:
@@ -106,11 +112,12 @@ jobs:
 
       - name: Generate checksums
         working-directory: release-dist
-        run: sha256sum *.tar.gz > checksums.txt
+        run: sha256sum *.tar.gz warmplane-*-apple-darwin > checksums.txt
 
       - name: Publish release assets
         uses: softprops/action-gh-release@v2
         with:
           files: |
             release-dist/*.tar.gz
+            release-dist/warmplane-*-apple-darwin
             release-dist/checksums.txt
