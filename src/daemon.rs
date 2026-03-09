@@ -14,9 +14,9 @@ use rmcp::{
     },
     ServiceExt,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::{atomic::{AtomicU64, Ordering}, Arc}, time::Duration};
 use tokio::{
     net::TcpListener,
     process::Command,
@@ -33,6 +33,7 @@ use crate::{
 };
 
 const DEFAULT_MCP_PROTOCOL_VERSION: &str = "2025-11-25";
+static STATELESS_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 pub enum ServerMsg {
     CallTool {
@@ -513,6 +514,461 @@ struct InitializedServer {
     prompts: Vec<(String, PromptMeta)>,
 }
 
+struct StatelessHttpRpcResponse {
+    payload: Option<Value>,
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StatelessJsonRpcError {
+    #[serde(default)]
+    code: Option<Value>,
+    message: String,
+    #[serde(default)]
+    data: Option<Value>,
+}
+
+fn next_stateless_request_id() -> u64 {
+    STATELESS_REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+fn header_protocol_version(headers: &HeaderMap) -> String {
+    headers
+        .get("mcp-protocol-version")
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| DEFAULT_MCP_PROTOCOL_VERSION.to_string())
+}
+
+fn parse_stateless_http_response(body: &str) -> Result<Option<Value>> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return serde_json::from_str(trimmed)
+            .map(Some)
+            .context("Failed to parse JSON-RPC response body");
+    }
+
+    let mut data_lines = Vec::new();
+    for line in trimmed.lines() {
+        if let Some(data) = line.strip_prefix("data:") {
+            data_lines.push(data.trim_start());
+        }
+    }
+
+    if data_lines.is_empty() {
+        anyhow::bail!("Failed to parse event-stream response body");
+    }
+
+    let payload = data_lines.join("\n");
+    serde_json::from_str(&payload)
+        .map(Some)
+        .context("Failed to parse JSON-RPC event-stream payload")
+}
+
+fn stateless_json_rpc_error_message(error: StatelessJsonRpcError) -> String {
+    let mut message = error.message;
+    if let Some(code) = error.code {
+        message = format!("{} (code: {})", message, code);
+    }
+    if let Some(data) = error.data {
+        message = format!("{}; data: {}", message, data);
+    }
+    message
+}
+
+async fn stateless_http_rpc(
+    client: &reqwest::Client,
+    url: &str,
+    session_id: Option<&str>,
+    payload: &Value,
+) -> std::result::Result<StatelessHttpRpcResponse, String> {
+    let mut request = client
+        .post(url)
+        .header("accept", "application/json, text/event-stream")
+        .json(payload);
+    if let Some(session_id) = session_id {
+        request = request.header("mcp-session-id", session_id);
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("HTTP request failed: {}", error))?;
+
+    let status = response.status();
+    let response_session_id = response
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string);
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("Failed to read HTTP response body: {}", error))?;
+
+    if !status.is_success() {
+        let suffix = if body.trim().is_empty() {
+            String::new()
+        } else {
+            format!(": {}", body.trim())
+        };
+        return Err(format!("HTTP {}{}", status, suffix));
+    }
+
+    let parsed = parse_stateless_http_response(&body).map_err(|error| error.to_string())?;
+    if let Some(value) = &parsed {
+        if let Some(error_value) = value.get("error") {
+            if let Ok(error) = serde_json::from_value::<StatelessJsonRpcError>(error_value.clone()) {
+                return Err(stateless_json_rpc_error_message(error));
+            }
+            return Err(format!("JSON-RPC error: {}", error_value));
+        }
+    }
+
+    Ok(StatelessHttpRpcResponse {
+        payload: parsed,
+        session_id: response_session_id,
+    })
+}
+
+async fn initialize_stateless_http_server(
+    server_id: String,
+    url: String,
+    headers: HeaderMap,
+    capability_aliases: Arc<HashMap<String, String>>,
+    resource_aliases: Arc<HashMap<String, String>>,
+    prompt_aliases: Arc<HashMap<String, String>>,
+    tool_timeout_ms: u64,
+) -> InitializedServer {
+    let protocol_version = header_protocol_version(&headers);
+    let startup_timeout = Duration::from_millis(tool_timeout_ms);
+    let client = match reqwest::Client::builder().default_headers(headers).build() {
+        Ok(value) => value,
+        Err(error) => {
+            let readiness = readiness(
+                "transport_unavailable",
+                format!("Failed to build HTTP client for {}: {}", server_id, error),
+                true,
+            );
+            warn!(%server_id, code = %readiness.code, message = %readiness.message, retryable = readiness.retryable, "skipping upstream server during startup");
+            return InitializedServer {
+                server_id,
+                readiness,
+                sender: None,
+                capabilities: vec![],
+                resources: vec![],
+                prompts: vec![],
+            };
+        }
+    };
+
+    let initialize_payload = json!({
+        "jsonrpc": "2.0",
+        "id": next_stateless_request_id(),
+        "method": "initialize",
+        "params": {
+            "protocolVersion": protocol_version,
+            "capabilities": {},
+            "clientInfo": {
+                "name": "warmplane",
+                "version": env!("CARGO_PKG_VERSION"),
+            }
+        }
+    });
+
+    let initialize_result = timeout(
+        startup_timeout,
+        stateless_http_rpc(&client, &url, None, &initialize_payload),
+    )
+    .await;
+    let initialized_session_id = match initialize_result {
+        Ok(Ok(response)) => response.session_id,
+        Ok(Err(error)) => {
+            let readiness = readiness(
+                "transport_unavailable",
+                format!(
+                    "Failed to negotiate stateless HTTP MCP connection for {}: {}",
+                    server_id, error
+                ),
+                true,
+            );
+            warn!(%server_id, code = %readiness.code, message = %readiness.message, retryable = readiness.retryable, "skipping upstream server during startup");
+            return InitializedServer {
+                server_id,
+                readiness,
+                sender: None,
+                capabilities: vec![],
+                resources: vec![],
+                prompts: vec![],
+            };
+        }
+        Err(_) => {
+            let readiness = readiness(
+                "transport_unavailable",
+                format!(
+                    "Failed to negotiate stateless HTTP MCP connection for {}: Initialize timed out after {}ms",
+                    server_id, tool_timeout_ms
+                ),
+                true,
+            );
+            warn!(%server_id, code = %readiness.code, message = %readiness.message, retryable = readiness.retryable, "skipping upstream server during startup");
+            return InitializedServer {
+                server_id,
+                readiness,
+                sender: None,
+                capabilities: vec![],
+                resources: vec![],
+                prompts: vec![],
+            };
+        }
+    };
+
+    let initialized_payload = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
+        "params": {}
+    });
+    let initialized_result = timeout(
+        startup_timeout,
+        stateless_http_rpc(&client, &url, initialized_session_id.as_deref(), &initialized_payload),
+    )
+    .await;
+    if let Err(error) = match initialized_result {
+        Ok(result) => result.map(|_| ()),
+        Err(_) => Err(format!("Initialized notification timed out after {}ms", tool_timeout_ms)),
+    } {
+        let readiness = readiness(
+            "transport_unavailable",
+            format!(
+                "Failed to finalize stateless HTTP MCP initialization for {}: {}",
+                server_id, error
+            ),
+            true,
+        );
+        warn!(%server_id, code = %readiness.code, message = %readiness.message, retryable = readiness.retryable, "skipping upstream server during startup");
+        return InitializedServer {
+            server_id,
+            readiness,
+            sender: None,
+            capabilities: vec![],
+            resources: vec![],
+            prompts: vec![],
+        };
+    }
+
+    let mut capabilities = vec![];
+    let mut resources = vec![];
+    let mut prompts = vec![];
+
+    let tools_response = timeout(
+        startup_timeout,
+        stateless_http_rpc(
+            &client,
+            &url,
+            initialized_session_id.as_deref(),
+            &json!({
+                "jsonrpc": "2.0",
+                "id": next_stateless_request_id(),
+                "method": "tools/list",
+                "params": {}
+            }),
+        ),
+    )
+    .await;
+    if let Ok(Ok(response)) = tools_response {
+        if let Some(tools_value) = response.payload {
+        if let Some(tools_array) = tools_value.get("result").and_then(|r| r.get("tools")).and_then(|t| t.as_array()) {
+            for tool in tools_array {
+                if let Some(tool_name) = tool.get("name").and_then(|n| n.as_str()) {
+                    info!(%server_id, tool_name = %tool_name, "registered upstream tool");
+                    let source_id = format!("{}.{}", server_id, tool_name);
+                    let capability_id = capability_aliases.get(&source_id).cloned().unwrap_or(source_id);
+                    let summary = tool.get("description").and_then(|v| v.as_str()).unwrap_or("No summary available").to_string();
+                    let description = summary.clone();
+                    let input_schema = tool.get("inputSchema").cloned().unwrap_or_else(|| json!({}));
+                    capabilities.push((
+                        capability_id,
+                        CapabilityMeta {
+                            server: server_id.clone(),
+                            tool: tool_name.to_string(),
+                            summary,
+                            description,
+                            input_schema,
+                            tags: vec![server_id.clone()],
+                            examples: vec![],
+                        },
+                    ));
+                }
+            }
+        }
+        }
+    }
+
+    let resources_response = timeout(
+        startup_timeout,
+        stateless_http_rpc(
+            &client,
+            &url,
+            initialized_session_id.as_deref(),
+            &json!({
+                "jsonrpc": "2.0",
+                "id": next_stateless_request_id(),
+                "method": "resources/list",
+                "params": {}
+            }),
+        ),
+    )
+    .await;
+    if let Ok(Ok(response)) = resources_response {
+        if let Some(resources_value) = response.payload {
+        if let Some(resource_array) = resources_value.get("result").and_then(|r| r.get("resources")).and_then(|r| r.as_array()) {
+            for resource in resource_array {
+                let Some(uri) = resource.get("uri").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let name = resource.get("name").and_then(|v| v.as_str()).unwrap_or(uri).to_string();
+                let source_id = format!("{}.{}", server_id, uri);
+                let resource_id = resource_aliases.get(&source_id).cloned().unwrap_or(source_id);
+                let description = resource.get("description").and_then(|v| v.as_str()).map(ToString::to_string);
+                let mime_type = resource.get("mimeType").and_then(|v| v.as_str()).map(ToString::to_string);
+                info!(%server_id, uri = %uri, "registered upstream resource");
+                resources.push((
+                    resource_id,
+                    ResourceMeta {
+                        server: server_id.clone(),
+                        uri: uri.to_string(),
+                        name,
+                        description,
+                        mime_type,
+                        tags: vec![server_id.clone()],
+                    },
+                ));
+            }
+        }
+        }
+    }
+
+    let prompts_response = timeout(
+        startup_timeout,
+        stateless_http_rpc(
+            &client,
+            &url,
+            initialized_session_id.as_deref(),
+            &json!({
+                "jsonrpc": "2.0",
+                "id": next_stateless_request_id(),
+                "method": "prompts/list",
+                "params": {}
+            }),
+        ),
+    )
+    .await;
+    if let Ok(Ok(response)) = prompts_response {
+        if let Some(prompts_value) = response.payload {
+        if let Some(result_value) = prompts_value.get("result") {
+            for prompt in prompt_items_from_value(result_value) {
+                let Some(name) = prompt.get("name").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let source_id = format!("{}.{}", server_id, name);
+                let prompt_id = prompt_aliases.get(&source_id).cloned().unwrap_or(source_id);
+                let title = prompt.get("title").and_then(|v| v.as_str()).map(ToString::to_string);
+                let description = prompt.get("description").and_then(|v| v.as_str()).map(ToString::to_string);
+                let arguments = prompt.get("arguments").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                info!(%server_id, prompt_name = %name, "registered upstream prompt");
+                prompts.push((
+                    prompt_id,
+                    PromptMeta {
+                        server: server_id.clone(),
+                        name: name.to_string(),
+                        title,
+                        description,
+                        arguments,
+                        tags: vec![server_id.clone()],
+                    },
+                ));
+            }
+        }
+        }
+    }
+
+    let (tx, mut rx) = mpsc::channel::<ServerMsg>(32);
+    let per_server_timeout = Duration::from_millis(tool_timeout_ms);
+    let actor_client = client.clone();
+    let actor_url = url.clone();
+    let actor_session_id = initialized_session_id.clone();
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                ServerMsg::CallTool { name, params, reply } => {
+                    let payload = json!({
+                        "jsonrpc": "2.0",
+                        "id": next_stateless_request_id(),
+                        "method": "tools/call",
+                        "params": {
+                            "name": name,
+                            "arguments": params,
+                        }
+                    });
+                    let result = timeout(per_server_timeout, stateless_http_rpc(&actor_client, &actor_url, actor_session_id.as_deref(), &payload)).await;
+                    let res = match result {
+                        Ok(Ok(response)) => Ok(response.payload.and_then(|value| value.get("result").cloned()).unwrap_or(Value::Null)),
+                        Ok(Err(err)) => Err(UpstreamCallError::Upstream(err)),
+                        Err(_) => Err(UpstreamCallError::Timeout),
+                    };
+                    let _ = reply.send(res);
+                }
+                ServerMsg::ReadResource { uri, reply } => {
+                    let payload = json!({
+                        "jsonrpc": "2.0",
+                        "id": next_stateless_request_id(),
+                        "method": "resources/read",
+                        "params": { "uri": uri }
+                    });
+                    let result = timeout(per_server_timeout, stateless_http_rpc(&actor_client, &actor_url, actor_session_id.as_deref(), &payload)).await;
+                    let res = match result {
+                        Ok(Ok(response)) => Ok(response.payload.and_then(|value| value.get("result").cloned()).unwrap_or(Value::Null)),
+                        Ok(Err(err)) => Err(UpstreamCallError::Upstream(err)),
+                        Err(_) => Err(UpstreamCallError::Timeout),
+                    };
+                    let _ = reply.send(res);
+                }
+                ServerMsg::GetPrompt { name, arguments, reply } => {
+                    let payload = json!({
+                        "jsonrpc": "2.0",
+                        "id": next_stateless_request_id(),
+                        "method": "prompts/get",
+                        "params": {
+                            "name": name,
+                            "arguments": arguments,
+                        }
+                    });
+                    let result = timeout(per_server_timeout, stateless_http_rpc(&actor_client, &actor_url, actor_session_id.as_deref(), &payload)).await;
+                    let res = match result {
+                        Ok(Ok(response)) => Ok(response.payload.and_then(|value| value.get("result").cloned()).unwrap_or(Value::Null)),
+                        Ok(Err(err)) => Err(UpstreamCallError::Upstream(err)),
+                        Err(_) => Err(UpstreamCallError::Timeout),
+                    };
+                    let _ = reply.send(res);
+                }
+            }
+        }
+    });
+
+    InitializedServer {
+        server_id: server_id.clone(),
+        readiness: readiness("ready", format!("Server '{}' is ready", server_id), false),
+        sender: Some(tx),
+        capabilities,
+        resources,
+        prompts,
+    }
+}
+
 fn prompt_items_from_value(value: &Value) -> Vec<Value> {
     if let Some(items) = value.as_array() {
         return items.clone();
@@ -712,6 +1168,19 @@ async fn initialize_prepared_server(
             allow_stateless,
             headers,
         } => {
+            if allow_stateless.unwrap_or(false) {
+                return initialize_stateless_http_server(
+                    server_id,
+                    url,
+                    headers,
+                    capability_aliases,
+                    resource_aliases,
+                    prompt_aliases,
+                    tool_timeout_ms,
+                )
+                .await;
+            }
+
             let http_client = match reqwest::Client::builder().default_headers(headers).build() {
                 Ok(value) => value,
                 Err(error) => {
@@ -1085,8 +1554,8 @@ pub async fn run_daemon(port: u16, config: McpConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_http_headers, prompt_items_from_value, resolve_template_string, wildcard_match,
-        Policy,
+        build_http_headers, parse_stateless_http_response, prompt_items_from_value,
+        resolve_template_string, wildcard_match, Policy,
     };
     use crate::{
         auth_store::OAuthEntry,
@@ -1194,6 +1663,26 @@ mod tests {
 
         assert_eq!(prompt_items_from_value(&object_shape).len(), 2);
         assert_eq!(prompt_items_from_value(&array_shape).len(), 2);
+    }
+
+    #[test]
+    fn parse_stateless_http_response_supports_event_stream_payloads() {
+        let body = concat!(
+            "id:1\n",
+            "event:message\n",
+            "data:{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"webReader\"}]}}\n",
+        );
+
+        let parsed = parse_stateless_http_response(body)
+            .expect("event-stream payload should parse")
+            .expect("event-stream payload should produce a value");
+        assert_eq!(parsed["result"]["tools"][0]["name"], "webReader");
+    }
+
+    #[test]
+    fn parse_stateless_http_response_supports_empty_notification_responses() {
+        let parsed = parse_stateless_http_response("\n\n").expect("empty response should parse");
+        assert!(parsed.is_none());
     }
 
     #[tokio::test]
