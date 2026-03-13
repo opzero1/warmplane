@@ -191,7 +191,7 @@ OAuth contract notes:
 Discover upstream OAuth metadata before importing tokens:
 
 ```bash
-warmplane auth discover --config mcp_servers.json --server figma
+warmplane auth discover --config mcp_servers.json figma
 ```
 
 This resolves protected-resource and authorization-server metadata, then persists the normalized discovery record in the shared auth store so later status checks can show whether discovery has already succeeded.
@@ -199,19 +199,19 @@ This resolves protected-resource and authorization-server metadata, then persist
 Build a PKCE authorization URL and persist `state`/`codeVerifier` in the shared auth store:
 
 ```bash
-warmplane auth start --config mcp_servers.json --server figma
+warmplane auth start --config mcp_servers.json figma
 ```
 
 Run the integrated login flow with best-effort browser launch plus loopback callback capture:
 
 ```bash
-warmplane auth login --config mcp_servers.json --server figma
+warmplane auth login --config mcp_servers.json figma
 ```
 
 Exchange the callback `code` and `state` using the stored PKCE verifier:
 
 ```bash
-warmplane auth exchange --config mcp_servers.json --server figma --code <CODE> --state <STATE>
+warmplane auth exchange --config mcp_servers.json figma --code <CODE> --state <STATE>
 ```
 
 Inspect upstream OAuth readiness:
@@ -223,47 +223,48 @@ warmplane auth status --config mcp_servers.json
 Import tokens into the shared auth store without editing JSON by hand:
 
 ```bash
-warmplane auth import --config mcp_servers.json --server figma --access-token-env FIGMA_ACCESS_TOKEN --refresh-token-env FIGMA_REFRESH_TOKEN
+warmplane auth import --config mcp_servers.json figma --access-token-env FIGMA_ACCESS_TOKEN --refresh-token-env FIGMA_REFRESH_TOKEN
 ```
 
 Refresh stored OAuth credentials using the discovered token endpoint and refresh token:
 
 ```bash
-warmplane auth refresh --config mcp_servers.json --server figma
+warmplane auth refresh --config mcp_servers.json figma
 ```
 
 Remove stored credentials for one upstream:
 
 ```bash
-warmplane auth logout --config mcp_servers.json --server figma
+warmplane auth logout --config mcp_servers.json figma
 ```
 
 ## OAuth Operator Workflow
 
 Recommended bootstrap flow for a new OAuth-capable upstream:
 
-1. `warmplane auth discover --config mcp_servers.json --server <server>`
-2. `warmplane auth login --config mcp_servers.json --server <server>`
-3. `warmplane auth status --config mcp_servers.json --server <server>`
+1. `warmplane auth discover --config mcp_servers.json <server>`
+2. `warmplane auth login --config mcp_servers.json <server>`
+3. `warmplane auth status --config mcp_servers.json <server>`
 
 Fallback/manual flow when browser automation or callback capture is not convenient:
 
-1. `warmplane auth discover --config mcp_servers.json --server <server>`
-2. `warmplane auth start --config mcp_servers.json --server <server>`
+1. `warmplane auth discover --config mcp_servers.json <server>`
+2. `warmplane auth start --config mcp_servers.json <server>`
 3. Complete the browser flow yourself and capture the callback `code` + `state`
-4. `warmplane auth exchange --config mcp_servers.json --server <server> --code <CODE> --state <STATE>`
-5. `warmplane auth status --config mcp_servers.json --server <server>`
+4. `warmplane auth exchange --config mcp_servers.json <server> --code <CODE> --state <STATE>`
+5. `warmplane auth status --config mcp_servers.json <server>`
 
 Recovery and cleanup:
 
-- `warmplane auth refresh --config mcp_servers.json --server <server>` to rotate expired credentials manually
-- `warmplane auth logout --config mcp_servers.json --server <server>` to remove stored state and tokens
+- `warmplane auth refresh --config mcp_servers.json <server>` to rotate expired credentials manually
+- Long-lived HTTP upstream sessions now re-check OAuth state at request time and refresh expired tokens automatically before sending the next MCP call when refresh prerequisites are present.
+- `warmplane auth logout --config mcp_servers.json <server>` to remove stored state and tokens
 - `warmplane validate-config --config mcp_servers.json` before retrying if auth bootstrap behaves unexpectedly
 
 Troubleshooting and rollback diagnostics:
 
-- `warmplane auth status --config mcp_servers.json --server <server>` to inspect discovery readiness, client readiness, refresh-token availability, and auth status
-- `warmplane auth logout --config mcp_servers.json --server <server>` followed by `warmplane auth login --config mcp_servers.json --server <server>` to recover from bad or stale local auth state
+- `warmplane auth status --config mcp_servers.json <server>` to inspect discovery readiness, client readiness, refresh-token availability, and auth status
+- `warmplane auth logout --config mcp_servers.json <server>` followed by `warmplane auth login --config mcp_servers.json <server>` to recover from bad or stale local auth state
 - Remove or restore the shared `mcp-auth.json` entry for the affected `tokenStoreKey` if you need to roll back to a clean pre-auth state
 
 ## Provider Compatibility Notes

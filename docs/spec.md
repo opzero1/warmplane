@@ -103,5 +103,5 @@ For oauth auth, Warmplane reads the shared `mcp-auth.json` store and injects the
 ## Auth Store Commands
 
 - `warmplane auth status --config mcp_servers.json`
-- `warmplane auth import --config mcp_servers.json --server <id> --access-token-env <ENV>`
-- `warmplane auth logout --config mcp_servers.json --server <id>`
+- `warmplane auth import --config mcp_servers.json <id> --access-token-env <ENV>`
+- `warmplane auth logout --config mcp_servers.json <id>`

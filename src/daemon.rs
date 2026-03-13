@@ -16,7 +16,14 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::HashMap, sync::{atomic::{AtomicU64, Ordering}, Arc}, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tokio::{
     net::TcpListener,
     process::Command,
@@ -26,13 +33,14 @@ use tokio::{
 use tracing::{info, warn};
 
 use crate::{
-    auth_store::{derive_auth_status, load_store, save_store, OAuthAuthStatus},
+    auth_store::{derive_auth_status, load_store, save_store, OAuthAuthStatus, OAuthEntry},
     config::{AuthConfig, McpConfig, PolicyConfig, ServerConfig, DEFAULT_TOOL_TIMEOUT_MS},
     http_v1,
     oauth_client::{refresh_oauth_tokens, OAuthRefreshRequest},
 };
 
 const DEFAULT_MCP_PROTOCOL_VERSION: &str = "2025-11-25";
+const OAUTH_REFRESH_SKEW_SECS: u64 = 300;
 static STATELESS_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 pub enum ServerMsg {
@@ -219,6 +227,7 @@ async fn build_http_headers(
     srv_cfg: &ServerConfig,
     auth_store_path: Option<&str>,
     resolved_url: Option<&str>,
+    oauth_locks: Option<RuntimeOAuthLocks>,
 ) -> std::result::Result<HeaderMap, ServerReadiness> {
     let mut headers = HeaderMap::new();
     let protocol_version = srv_cfg
@@ -325,6 +334,11 @@ async fn build_http_headers(
                 token_endpoint,
                 ..
             } => {
+                let _guard = if let Some(lock) = oauth_locks.map(|value| value.inner) {
+                    Some(lock.lock_owned().await)
+                } else {
+                    None
+                };
                 let (_, mut store) = load_store(auth_store_path).map_err(|error| {
                     readiness("auth_store_unavailable", error.to_string(), true)
                 })?;
@@ -355,7 +369,7 @@ async fn build_http_headers(
                                 readiness(
                                     "auth_expired",
                                     format!(
-                                        "Server '{}' oauth credentials are expired and no refresh token is available. Re-import credentials with 'warmplane auth import --config <path> --server {} ...'",
+                                        "Server '{}' oauth credentials are expired and no refresh token is available. Re-import credentials with 'warmplane auth import --config <path> {} ...'",
                                         server_id, server_id
                                     ),
                                     false,
@@ -371,7 +385,7 @@ async fn build_http_headers(
                                 readiness(
                                     "auth_discovery_missing",
                                     format!(
-                                        "Server '{}' oauth credentials are expired but discovery metadata is incomplete. Run 'warmplane auth discover --config <path> --server {}' first",
+                                        "Server '{}' oauth credentials are expired but discovery metadata is incomplete. Run 'warmplane auth discover --config <path> {}' first",
                                         server_id, server_id
                                     ),
                                     false,
@@ -433,7 +447,7 @@ async fn build_http_headers(
                         return Err(readiness(
                             "auth_missing",
                             format!(
-                                "Server '{}' missing usable oauth credentials. Run 'warmplane auth discover --config <path> --server {}' to inspect upstream metadata, then import credentials with 'warmplane auth import --config <path> --server {} --access-token-env <ENV>'",
+                                "Server '{}' missing usable oauth credentials. Run 'warmplane auth discover --config <path> {}' to inspect upstream metadata, then import credentials with 'warmplane auth import --config <path> {} --access-token-env <ENV>'",
                                 server_id,
                                 server_id,
                                 server_id
@@ -475,6 +489,200 @@ async fn build_http_headers(
     Ok(headers)
 }
 
+fn now_epoch_seconds() -> u64 {
+    (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default())
+    .as_secs()
+}
+
+fn oauth_header(token: &str) -> Result<HeaderValue> {
+    let mut auth = HeaderValue::from_str(&format!("Bearer {}", token))
+        .context("OAuth access token could not be encoded into an Authorization header")?;
+    auth.set_sensitive(true);
+    Ok(auth)
+}
+
+fn auth_headers(headers: &HeaderMap, token: &str) -> Result<HeaderMap> {
+    let mut out = headers.clone();
+    out.remove(AUTHORIZATION);
+    out.insert(AUTHORIZATION, oauth_header(token)?);
+    Ok(out)
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(AUTHORIZATION)?.to_str().ok()?;
+    value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))
+        .map(ToString::to_string)
+}
+
+fn token_from_entry(entry: &OAuthEntry) -> Result<String> {
+    entry
+        .tokens
+        .as_ref()
+        .map(|value| value.access_token.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| anyhow!("OAuth access token missing from auth store entry"))
+}
+
+fn token_expiring(entry: &OAuthEntry) -> bool {
+    entry
+        .tokens
+        .as_ref()
+        .and_then(|value| value.expires_at)
+        .map(|value| value <= now_epoch_seconds() + OAUTH_REFRESH_SKEW_SECS)
+        .unwrap_or(false)
+}
+
+fn auth_error(err: &str) -> bool {
+    let err = err.to_ascii_lowercase();
+    err.contains("auth required")
+        || err.contains("unauthorized")
+        || err.contains("forbidden")
+        || err.contains("http 401")
+        || err.contains("http 403")
+}
+
+impl RuntimeOAuth {
+    async fn access_token(&self, force_refresh: bool) -> Result<String> {
+        let (_, store) = load_store(self.auth_store_path.as_deref())?;
+        let entry = store.get(&self.key).cloned().ok_or_else(|| {
+            anyhow!(
+                "Server '{}' missing oauth credentials in auth store for '{}'",
+                self.server_id,
+                self.key
+            )
+        })?;
+        let status = derive_auth_status(Some(&entry), Some(&self.resolved_url));
+
+        if !force_refresh
+            && matches!(status, OAuthAuthStatus::Authenticated)
+            && !token_expiring(&entry)
+        {
+            return token_from_entry(&entry);
+        }
+
+        if matches!(status, OAuthAuthStatus::NotAuthenticated) {
+            return Err(anyhow!(
+                "Server '{}' missing usable oauth credentials. Re-authenticate or re-import credentials for '{}'",
+                self.server_id,
+                self.key
+            ));
+        }
+
+        let _guard = self.locks.inner.lock().await;
+
+        let (_, mut store) = load_store(self.auth_store_path.as_deref())?;
+        let current = store.get(&self.key).cloned().ok_or_else(|| {
+            anyhow!(
+                "Server '{}' missing oauth credentials in auth store for '{}'",
+                self.server_id,
+                self.key
+            )
+        })?;
+        let status = derive_auth_status(Some(&current), Some(&self.resolved_url));
+
+        if !force_refresh
+            && matches!(status, OAuthAuthStatus::Authenticated)
+            && !token_expiring(&current)
+        {
+            return token_from_entry(&current);
+        }
+
+        if matches!(status, OAuthAuthStatus::NotAuthenticated) {
+            return Err(anyhow!(
+                "Server '{}' missing usable oauth credentials. Re-authenticate or re-import credentials for '{}'",
+                self.server_id,
+                self.key
+            ));
+        }
+
+        let fallback = token_from_entry(&current).ok();
+        let hard_expired = matches!(status, OAuthAuthStatus::Expired);
+        match self.refresh_entry(current.clone()).await {
+            Ok(next) => {
+                let token = token_from_entry(&next)?;
+                store.insert(self.key.clone(), next);
+                save_store(self.auth_store_path.as_deref(), &store)?;
+                Ok(token)
+            }
+            Err(err) if !hard_expired && !force_refresh => {
+                if let Some(token) = fallback {
+                    warn!(%self.server_id, key = %self.key, error = %err, "oauth refresh failed before expiry; reusing current access token");
+                    return Ok(token);
+                }
+                Err(err)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn refresh_entry(&self, entry: OAuthEntry) -> Result<OAuthEntry> {
+        let refresh_token = entry
+            .tokens
+            .as_ref()
+            .and_then(|value| value.refresh_token.clone())
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow!(
+                    "Server '{}' oauth credentials are expired and no refresh token is available for '{}'",
+                    self.server_id,
+                    self.key
+                )
+            })?;
+        let token_endpoint = entry
+            .discovery
+            .as_ref()
+            .and_then(|value| value.token_endpoint.clone())
+            .or_else(|| self.token_endpoint.clone())
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow!(
+                    "Server '{}' oauth credentials are missing token endpoint metadata for '{}'",
+                    self.server_id,
+                    self.key
+                )
+            })?;
+        let scope = self
+            .scope
+            .clone()
+            .or_else(|| entry.tokens.as_ref().and_then(|value| value.scope.clone()));
+        let client_secret = resolve_secret(
+            &self.client_secret,
+            &self.client_secret_env,
+            &self.server_id,
+            "client secret",
+        )
+        .ok()
+        .or_else(|| {
+            entry
+                .client_info
+                .as_ref()
+                .and_then(|value| value.client_secret.clone())
+        });
+        let tokens = refresh_oauth_tokens(OAuthRefreshRequest {
+            token_endpoint,
+            refresh_token,
+            client_id: self.client_id.clone().or_else(|| {
+                entry
+                    .client_info
+                    .as_ref()
+                    .map(|value| value.client_id.clone())
+            }),
+            client_secret,
+            scope,
+        })
+        .await?;
+
+        let mut next = entry;
+        next.tokens = Some(tokens);
+        Ok(next)
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub servers: Arc<HashMap<String, mpsc::Sender<ServerMsg>>>,
@@ -497,6 +705,7 @@ enum PreparedServerTransport {
         url: String,
         allow_stateless: Option<bool>,
         headers: HeaderMap,
+        oauth: Option<RuntimeOAuth>,
     },
 }
 
@@ -517,6 +726,25 @@ struct InitializedServer {
 struct StatelessHttpRpcResponse {
     payload: Option<Value>,
     session_id: Option<String>,
+}
+
+#[derive(Clone, Default)]
+struct RuntimeOAuthLocks {
+    inner: Arc<tokio::sync::Mutex<()>>,
+}
+
+#[derive(Clone)]
+struct RuntimeOAuth {
+    server_id: String,
+    key: String,
+    auth_store_path: Option<String>,
+    resolved_url: String,
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    client_secret_env: Option<String>,
+    scope: Option<String>,
+    token_endpoint: Option<String>,
+    locks: RuntimeOAuthLocks,
 }
 
 #[derive(Debug, Deserialize)]
@@ -584,12 +812,16 @@ async fn stateless_http_rpc(
     client: &reqwest::Client,
     url: &str,
     session_id: Option<&str>,
+    authorization: Option<&HeaderValue>,
     payload: &Value,
 ) -> std::result::Result<StatelessHttpRpcResponse, String> {
     let mut request = client
         .post(url)
         .header("accept", "application/json, text/event-stream")
         .json(payload);
+    if let Some(authorization) = authorization {
+        request = request.header(AUTHORIZATION, authorization);
+    }
     if let Some(session_id) = session_id {
         request = request.header("mcp-session-id", session_id);
     }
@@ -622,7 +854,8 @@ async fn stateless_http_rpc(
     let parsed = parse_stateless_http_response(&body).map_err(|error| error.to_string())?;
     if let Some(value) = &parsed {
         if let Some(error_value) = value.get("error") {
-            if let Ok(error) = serde_json::from_value::<StatelessJsonRpcError>(error_value.clone()) {
+            if let Ok(error) = serde_json::from_value::<StatelessJsonRpcError>(error_value.clone())
+            {
                 return Err(stateless_json_rpc_error_message(error));
             }
             return Err(format!("JSON-RPC error: {}", error_value));
@@ -635,10 +868,103 @@ async fn stateless_http_rpc(
     })
 }
 
+async fn initialize_stateless_session(
+    client: &reqwest::Client,
+    url: &str,
+    authorization: Option<&HeaderValue>,
+    protocol_version: &str,
+    tool_timeout_ms: u64,
+) -> std::result::Result<Option<String>, String> {
+    let startup_timeout = Duration::from_millis(tool_timeout_ms);
+    let initialize_payload = json!({
+        "jsonrpc": "2.0",
+        "id": next_stateless_request_id(),
+        "method": "initialize",
+        "params": {
+            "protocolVersion": protocol_version,
+            "capabilities": {},
+            "clientInfo": {
+                "name": "warmplane",
+                "version": env!("CARGO_PKG_VERSION"),
+            }
+        }
+    });
+
+    let initialize_result = timeout(
+        startup_timeout,
+        stateless_http_rpc(client, url, None, authorization, &initialize_payload),
+    )
+    .await;
+    let initialized_session_id = match initialize_result {
+        Ok(Ok(response)) => response.session_id,
+        Ok(Err(error)) => {
+            return Err(format!(
+                "Failed to negotiate stateless HTTP MCP connection: {}",
+                error
+            ));
+        }
+        Err(_) => {
+            return Err(format!("Initialize timed out after {}ms", tool_timeout_ms));
+        }
+    };
+
+    let initialized_payload = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
+        "params": {}
+    });
+    let initialized_result = timeout(
+        startup_timeout,
+        stateless_http_rpc(
+            client,
+            url,
+            initialized_session_id.as_deref(),
+            authorization,
+            &initialized_payload,
+        ),
+    )
+    .await;
+    match initialized_result {
+        Ok(Ok(_)) => Ok(initialized_session_id),
+        Ok(Err(error)) => Err(format!(
+            "Failed to finalize stateless HTTP MCP initialization: {}",
+            error
+        )),
+        Err(_) => Err(format!(
+            "Initialized notification timed out after {}ms",
+            tool_timeout_ms
+        )),
+    }
+}
+
+async fn stateless_call_result(
+    client: &reqwest::Client,
+    url: &str,
+    session_id: Option<&str>,
+    authorization: Option<&HeaderValue>,
+    payload: &Value,
+    timeout_duration: Duration,
+) -> Result<Value, UpstreamCallError> {
+    let result = timeout(
+        timeout_duration,
+        stateless_http_rpc(client, url, session_id, authorization, payload),
+    )
+    .await;
+    match result {
+        Ok(Ok(response)) => Ok(response
+            .payload
+            .and_then(|value| value.get("result").cloned())
+            .unwrap_or(Value::Null)),
+        Ok(Err(err)) => Err(UpstreamCallError::Upstream(err)),
+        Err(_) => Err(UpstreamCallError::Timeout),
+    }
+}
+
 async fn initialize_stateless_http_server(
     server_id: String,
     url: String,
     headers: HeaderMap,
+    oauth: Option<RuntimeOAuth>,
     capability_aliases: Arc<HashMap<String, String>>,
     resource_aliases: Arc<HashMap<String, String>>,
     prompt_aliases: Arc<HashMap<String, String>>,
@@ -646,7 +972,55 @@ async fn initialize_stateless_http_server(
 ) -> InitializedServer {
     let protocol_version = header_protocol_version(&headers);
     let startup_timeout = Duration::from_millis(tool_timeout_ms);
-    let client = match reqwest::Client::builder().default_headers(headers).build() {
+    let mut base_headers = headers.clone();
+    base_headers.remove(AUTHORIZATION);
+    let initial_auth = match headers.get(AUTHORIZATION).cloned() {
+        Some(value) => Some(value),
+        None => match &oauth {
+            Some(oauth) => match oauth.access_token(false).await {
+                Ok(token) => match oauth_header(&token) {
+                    Ok(value) => Some(value),
+                    Err(error) => {
+                        let readiness = readiness(
+                            "transport_unavailable",
+                            format!("Failed to encode OAuth header for {}: {}", server_id, error),
+                            true,
+                        );
+                        warn!(%server_id, code = %readiness.code, message = %readiness.message, retryable = readiness.retryable, "skipping upstream server during startup");
+                        return InitializedServer {
+                            server_id,
+                            readiness,
+                            sender: None,
+                            capabilities: vec![],
+                            resources: vec![],
+                            prompts: vec![],
+                        };
+                    }
+                },
+                Err(error) => {
+                    let readiness = readiness(
+                        "transport_unavailable",
+                        format!("Failed to load OAuth token for {}: {}", server_id, error),
+                        true,
+                    );
+                    warn!(%server_id, code = %readiness.code, message = %readiness.message, retryable = readiness.retryable, "skipping upstream server during startup");
+                    return InitializedServer {
+                        server_id,
+                        readiness,
+                        sender: None,
+                        capabilities: vec![],
+                        resources: vec![],
+                        prompts: vec![],
+                    };
+                }
+            },
+            None => None,
+        },
+    };
+    let client = match reqwest::Client::builder()
+        .default_headers(base_headers.clone())
+        .build()
+    {
         Ok(value) => value,
         Err(error) => {
             let readiness = readiness(
@@ -666,28 +1040,17 @@ async fn initialize_stateless_http_server(
         }
     };
 
-    let initialize_payload = json!({
-        "jsonrpc": "2.0",
-        "id": next_stateless_request_id(),
-        "method": "initialize",
-        "params": {
-            "protocolVersion": protocol_version,
-            "capabilities": {},
-            "clientInfo": {
-                "name": "warmplane",
-                "version": env!("CARGO_PKG_VERSION"),
-            }
-        }
-    });
-
-    let initialize_result = timeout(
-        startup_timeout,
-        stateless_http_rpc(&client, &url, None, &initialize_payload),
+    let initialized_session_id = match initialize_stateless_session(
+        &client,
+        &url,
+        initial_auth.as_ref(),
+        &protocol_version,
+        tool_timeout_ms,
     )
-    .await;
-    let initialized_session_id = match initialize_result {
-        Ok(Ok(response)) => response.session_id,
-        Ok(Err(error)) => {
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => {
             let readiness = readiness(
                 "transport_unavailable",
                 format!(
@@ -706,59 +1069,7 @@ async fn initialize_stateless_http_server(
                 prompts: vec![],
             };
         }
-        Err(_) => {
-            let readiness = readiness(
-                "transport_unavailable",
-                format!(
-                    "Failed to negotiate stateless HTTP MCP connection for {}: Initialize timed out after {}ms",
-                    server_id, tool_timeout_ms
-                ),
-                true,
-            );
-            warn!(%server_id, code = %readiness.code, message = %readiness.message, retryable = readiness.retryable, "skipping upstream server during startup");
-            return InitializedServer {
-                server_id,
-                readiness,
-                sender: None,
-                capabilities: vec![],
-                resources: vec![],
-                prompts: vec![],
-            };
-        }
     };
-
-    let initialized_payload = json!({
-        "jsonrpc": "2.0",
-        "method": "notifications/initialized",
-        "params": {}
-    });
-    let initialized_result = timeout(
-        startup_timeout,
-        stateless_http_rpc(&client, &url, initialized_session_id.as_deref(), &initialized_payload),
-    )
-    .await;
-    if let Err(error) = match initialized_result {
-        Ok(result) => result.map(|_| ()),
-        Err(_) => Err(format!("Initialized notification timed out after {}ms", tool_timeout_ms)),
-    } {
-        let readiness = readiness(
-            "transport_unavailable",
-            format!(
-                "Failed to finalize stateless HTTP MCP initialization for {}: {}",
-                server_id, error
-            ),
-            true,
-        );
-        warn!(%server_id, code = %readiness.code, message = %readiness.message, retryable = readiness.retryable, "skipping upstream server during startup");
-        return InitializedServer {
-            server_id,
-            readiness,
-            sender: None,
-            capabilities: vec![],
-            resources: vec![],
-            prompts: vec![],
-        };
-    }
 
     let mut capabilities = vec![];
     let mut resources = vec![];
@@ -770,6 +1081,7 @@ async fn initialize_stateless_http_server(
             &client,
             &url,
             initialized_session_id.as_deref(),
+            initial_auth.as_ref(),
             &json!({
                 "jsonrpc": "2.0",
                 "id": next_stateless_request_id(),
@@ -781,30 +1093,44 @@ async fn initialize_stateless_http_server(
     .await;
     if let Ok(Ok(response)) = tools_response {
         if let Some(tools_value) = response.payload {
-        if let Some(tools_array) = tools_value.get("result").and_then(|r| r.get("tools")).and_then(|t| t.as_array()) {
-            for tool in tools_array {
-                if let Some(tool_name) = tool.get("name").and_then(|n| n.as_str()) {
-                    info!(%server_id, tool_name = %tool_name, "registered upstream tool");
-                    let source_id = format!("{}.{}", server_id, tool_name);
-                    let capability_id = capability_aliases.get(&source_id).cloned().unwrap_or(source_id);
-                    let summary = tool.get("description").and_then(|v| v.as_str()).unwrap_or("No summary available").to_string();
-                    let description = summary.clone();
-                    let input_schema = tool.get("inputSchema").cloned().unwrap_or_else(|| json!({}));
-                    capabilities.push((
-                        capability_id,
-                        CapabilityMeta {
-                            server: server_id.clone(),
-                            tool: tool_name.to_string(),
-                            summary,
-                            description,
-                            input_schema,
-                            tags: vec![server_id.clone()],
-                            examples: vec![],
-                        },
-                    ));
+            if let Some(tools_array) = tools_value
+                .get("result")
+                .and_then(|r| r.get("tools"))
+                .and_then(|t| t.as_array())
+            {
+                for tool in tools_array {
+                    if let Some(tool_name) = tool.get("name").and_then(|n| n.as_str()) {
+                        info!(%server_id, tool_name = %tool_name, "registered upstream tool");
+                        let source_id = format!("{}.{}", server_id, tool_name);
+                        let capability_id = capability_aliases
+                            .get(&source_id)
+                            .cloned()
+                            .unwrap_or(source_id);
+                        let summary = tool
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("No summary available")
+                            .to_string();
+                        let description = summary.clone();
+                        let input_schema = tool
+                            .get("inputSchema")
+                            .cloned()
+                            .unwrap_or_else(|| json!({}));
+                        capabilities.push((
+                            capability_id,
+                            CapabilityMeta {
+                                server: server_id.clone(),
+                                tool: tool_name.to_string(),
+                                summary,
+                                description,
+                                input_schema,
+                                tags: vec![server_id.clone()],
+                                examples: vec![],
+                            },
+                        ));
+                    }
                 }
             }
-        }
         }
     }
 
@@ -814,6 +1140,7 @@ async fn initialize_stateless_http_server(
             &client,
             &url,
             initialized_session_id.as_deref(),
+            initial_auth.as_ref(),
             &json!({
                 "jsonrpc": "2.0",
                 "id": next_stateless_request_id(),
@@ -825,30 +1152,47 @@ async fn initialize_stateless_http_server(
     .await;
     if let Ok(Ok(response)) = resources_response {
         if let Some(resources_value) = response.payload {
-        if let Some(resource_array) = resources_value.get("result").and_then(|r| r.get("resources")).and_then(|r| r.as_array()) {
-            for resource in resource_array {
-                let Some(uri) = resource.get("uri").and_then(|v| v.as_str()) else {
-                    continue;
-                };
-                let name = resource.get("name").and_then(|v| v.as_str()).unwrap_or(uri).to_string();
-                let source_id = format!("{}.{}", server_id, uri);
-                let resource_id = resource_aliases.get(&source_id).cloned().unwrap_or(source_id);
-                let description = resource.get("description").and_then(|v| v.as_str()).map(ToString::to_string);
-                let mime_type = resource.get("mimeType").and_then(|v| v.as_str()).map(ToString::to_string);
-                info!(%server_id, uri = %uri, "registered upstream resource");
-                resources.push((
-                    resource_id,
-                    ResourceMeta {
-                        server: server_id.clone(),
-                        uri: uri.to_string(),
-                        name,
-                        description,
-                        mime_type,
-                        tags: vec![server_id.clone()],
-                    },
-                ));
+            if let Some(resource_array) = resources_value
+                .get("result")
+                .and_then(|r| r.get("resources"))
+                .and_then(|r| r.as_array())
+            {
+                for resource in resource_array {
+                    let Some(uri) = resource.get("uri").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    let name = resource
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(uri)
+                        .to_string();
+                    let source_id = format!("{}.{}", server_id, uri);
+                    let resource_id = resource_aliases
+                        .get(&source_id)
+                        .cloned()
+                        .unwrap_or(source_id);
+                    let description = resource
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string);
+                    let mime_type = resource
+                        .get("mimeType")
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string);
+                    info!(%server_id, uri = %uri, "registered upstream resource");
+                    resources.push((
+                        resource_id,
+                        ResourceMeta {
+                            server: server_id.clone(),
+                            uri: uri.to_string(),
+                            name,
+                            description,
+                            mime_type,
+                            tags: vec![server_id.clone()],
+                        },
+                    ));
+                }
             }
-        }
         }
     }
 
@@ -858,6 +1202,7 @@ async fn initialize_stateless_http_server(
             &client,
             &url,
             initialized_session_id.as_deref(),
+            initial_auth.as_ref(),
             &json!({
                 "jsonrpc": "2.0",
                 "id": next_stateless_request_id(),
@@ -869,30 +1214,40 @@ async fn initialize_stateless_http_server(
     .await;
     if let Ok(Ok(response)) = prompts_response {
         if let Some(prompts_value) = response.payload {
-        if let Some(result_value) = prompts_value.get("result") {
-            for prompt in prompt_items_from_value(result_value) {
-                let Some(name) = prompt.get("name").and_then(|v| v.as_str()) else {
-                    continue;
-                };
-                let source_id = format!("{}.{}", server_id, name);
-                let prompt_id = prompt_aliases.get(&source_id).cloned().unwrap_or(source_id);
-                let title = prompt.get("title").and_then(|v| v.as_str()).map(ToString::to_string);
-                let description = prompt.get("description").and_then(|v| v.as_str()).map(ToString::to_string);
-                let arguments = prompt.get("arguments").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-                info!(%server_id, prompt_name = %name, "registered upstream prompt");
-                prompts.push((
-                    prompt_id,
-                    PromptMeta {
-                        server: server_id.clone(),
-                        name: name.to_string(),
-                        title,
-                        description,
-                        arguments,
-                        tags: vec![server_id.clone()],
-                    },
-                ));
+            if let Some(result_value) = prompts_value.get("result") {
+                for prompt in prompt_items_from_value(result_value) {
+                    let Some(name) = prompt.get("name").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    let source_id = format!("{}.{}", server_id, name);
+                    let prompt_id = prompt_aliases.get(&source_id).cloned().unwrap_or(source_id);
+                    let title = prompt
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string);
+                    let description = prompt
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string);
+                    let arguments = prompt
+                        .get("arguments")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    info!(%server_id, prompt_name = %name, "registered upstream prompt");
+                    prompts.push((
+                        prompt_id,
+                        PromptMeta {
+                            server: server_id.clone(),
+                            name: name.to_string(),
+                            title,
+                            description,
+                            arguments,
+                            tags: vec![server_id.clone()],
+                        },
+                    ));
+                }
             }
-        }
         }
     }
 
@@ -900,11 +1255,82 @@ async fn initialize_stateless_http_server(
     let per_server_timeout = Duration::from_millis(tool_timeout_ms);
     let actor_client = client.clone();
     let actor_url = url.clone();
-    let actor_session_id = initialized_session_id.clone();
+    let actor_oauth = oauth.clone();
+    let actor_protocol_version = protocol_version.clone();
+    let mut actor_session_id = initialized_session_id.clone();
+    let mut actor_auth = initial_auth.clone();
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
+            if let Some(oauth) = actor_oauth.as_ref() {
+                let token = match oauth.access_token(false).await {
+                    Ok(value) => value,
+                    Err(err) => {
+                        let err = Err(UpstreamCallError::Upstream(err.to_string()));
+                        match msg {
+                            ServerMsg::CallTool { reply, .. }
+                            | ServerMsg::ReadResource { reply, .. }
+                            | ServerMsg::GetPrompt { reply, .. } => {
+                                let _ = reply.send(err);
+                            }
+                        }
+                        continue;
+                    }
+                };
+                let token_changed = actor_auth
+                    .as_ref()
+                    .and_then(|value| value.to_str().ok())
+                    .map(|value| value != format!("Bearer {}", token))
+                    .unwrap_or(true);
+                if token_changed {
+                    match oauth_header(&token) {
+                        Ok(value) => {
+                            actor_auth = Some(value);
+                        }
+                        Err(err) => {
+                            let err = Err(UpstreamCallError::Upstream(err.to_string()));
+                            match msg {
+                                ServerMsg::CallTool { reply, .. }
+                                | ServerMsg::ReadResource { reply, .. }
+                                | ServerMsg::GetPrompt { reply, .. } => {
+                                    let _ = reply.send(err);
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    match initialize_stateless_session(
+                        &actor_client,
+                        &actor_url,
+                        actor_auth.as_ref(),
+                        &actor_protocol_version,
+                        tool_timeout_ms,
+                    )
+                    .await
+                    {
+                        Ok(value) => {
+                            actor_session_id = value;
+                        }
+                        Err(err) => {
+                            let err = Err(UpstreamCallError::Upstream(err));
+                            match msg {
+                                ServerMsg::CallTool { reply, .. }
+                                | ServerMsg::ReadResource { reply, .. }
+                                | ServerMsg::GetPrompt { reply, .. } => {
+                                    let _ = reply.send(err);
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+
             match msg {
-                ServerMsg::CallTool { name, params, reply } => {
+                ServerMsg::CallTool {
+                    name,
+                    params,
+                    reply,
+                } => {
                     let payload = json!({
                         "jsonrpc": "2.0",
                         "id": next_stateless_request_id(),
@@ -914,12 +1340,45 @@ async fn initialize_stateless_http_server(
                             "arguments": params,
                         }
                     });
-                    let result = timeout(per_server_timeout, stateless_http_rpc(&actor_client, &actor_url, actor_session_id.as_deref(), &payload)).await;
-                    let res = match result {
-                        Ok(Ok(response)) => Ok(response.payload.and_then(|value| value.get("result").cloned()).unwrap_or(Value::Null)),
-                        Ok(Err(err)) => Err(UpstreamCallError::Upstream(err)),
-                        Err(_) => Err(UpstreamCallError::Timeout),
-                    };
+                    let mut res = stateless_call_result(
+                        &actor_client,
+                        &actor_url,
+                        actor_session_id.as_deref(),
+                        actor_auth.as_ref(),
+                        &payload,
+                        per_server_timeout,
+                    )
+                    .await;
+                    if matches!(&res, Err(UpstreamCallError::Upstream(err)) if actor_oauth.is_some() && auth_error(err))
+                    {
+                        if let Some(oauth) = actor_oauth.as_ref() {
+                            if let Ok(token) = oauth.access_token(true).await {
+                                if let Ok(value) = oauth_header(&token) {
+                                    actor_auth = Some(value);
+                                    if let Ok(value) = initialize_stateless_session(
+                                        &actor_client,
+                                        &actor_url,
+                                        actor_auth.as_ref(),
+                                        &actor_protocol_version,
+                                        tool_timeout_ms,
+                                    )
+                                    .await
+                                    {
+                                        actor_session_id = value;
+                                        res = stateless_call_result(
+                                            &actor_client,
+                                            &actor_url,
+                                            actor_session_id.as_deref(),
+                                            actor_auth.as_ref(),
+                                            &payload,
+                                            per_server_timeout,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     let _ = reply.send(res);
                 }
                 ServerMsg::ReadResource { uri, reply } => {
@@ -929,15 +1388,52 @@ async fn initialize_stateless_http_server(
                         "method": "resources/read",
                         "params": { "uri": uri }
                     });
-                    let result = timeout(per_server_timeout, stateless_http_rpc(&actor_client, &actor_url, actor_session_id.as_deref(), &payload)).await;
-                    let res = match result {
-                        Ok(Ok(response)) => Ok(response.payload.and_then(|value| value.get("result").cloned()).unwrap_or(Value::Null)),
-                        Ok(Err(err)) => Err(UpstreamCallError::Upstream(err)),
-                        Err(_) => Err(UpstreamCallError::Timeout),
-                    };
+                    let mut res = stateless_call_result(
+                        &actor_client,
+                        &actor_url,
+                        actor_session_id.as_deref(),
+                        actor_auth.as_ref(),
+                        &payload,
+                        per_server_timeout,
+                    )
+                    .await;
+                    if matches!(&res, Err(UpstreamCallError::Upstream(err)) if actor_oauth.is_some() && auth_error(err))
+                    {
+                        if let Some(oauth) = actor_oauth.as_ref() {
+                            if let Ok(token) = oauth.access_token(true).await {
+                                if let Ok(value) = oauth_header(&token) {
+                                    actor_auth = Some(value);
+                                    if let Ok(value) = initialize_stateless_session(
+                                        &actor_client,
+                                        &actor_url,
+                                        actor_auth.as_ref(),
+                                        &actor_protocol_version,
+                                        tool_timeout_ms,
+                                    )
+                                    .await
+                                    {
+                                        actor_session_id = value;
+                                        res = stateless_call_result(
+                                            &actor_client,
+                                            &actor_url,
+                                            actor_session_id.as_deref(),
+                                            actor_auth.as_ref(),
+                                            &payload,
+                                            per_server_timeout,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     let _ = reply.send(res);
                 }
-                ServerMsg::GetPrompt { name, arguments, reply } => {
+                ServerMsg::GetPrompt {
+                    name,
+                    arguments,
+                    reply,
+                } => {
                     let payload = json!({
                         "jsonrpc": "2.0",
                         "id": next_stateless_request_id(),
@@ -947,12 +1443,45 @@ async fn initialize_stateless_http_server(
                             "arguments": arguments,
                         }
                     });
-                    let result = timeout(per_server_timeout, stateless_http_rpc(&actor_client, &actor_url, actor_session_id.as_deref(), &payload)).await;
-                    let res = match result {
-                        Ok(Ok(response)) => Ok(response.payload.and_then(|value| value.get("result").cloned()).unwrap_or(Value::Null)),
-                        Ok(Err(err)) => Err(UpstreamCallError::Upstream(err)),
-                        Err(_) => Err(UpstreamCallError::Timeout),
-                    };
+                    let mut res = stateless_call_result(
+                        &actor_client,
+                        &actor_url,
+                        actor_session_id.as_deref(),
+                        actor_auth.as_ref(),
+                        &payload,
+                        per_server_timeout,
+                    )
+                    .await;
+                    if matches!(&res, Err(UpstreamCallError::Upstream(err)) if actor_oauth.is_some() && auth_error(err))
+                    {
+                        if let Some(oauth) = actor_oauth.as_ref() {
+                            if let Ok(token) = oauth.access_token(true).await {
+                                if let Ok(value) = oauth_header(&token) {
+                                    actor_auth = Some(value);
+                                    if let Ok(value) = initialize_stateless_session(
+                                        &actor_client,
+                                        &actor_url,
+                                        actor_auth.as_ref(),
+                                        &actor_protocol_version,
+                                        tool_timeout_ms,
+                                    )
+                                    .await
+                                    {
+                                        actor_session_id = value;
+                                        res = stateless_call_result(
+                                            &actor_client,
+                                            &actor_url,
+                                            actor_session_id.as_deref(),
+                                            actor_auth.as_ref(),
+                                            &payload,
+                                            per_server_timeout,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     let _ = reply.send(res);
                 }
             }
@@ -985,6 +1514,7 @@ async fn prepare_server_startup(
     server_id: String,
     srv_cfg: ServerConfig,
     auth_store_path: Option<String>,
+    oauth_locks: RuntimeOAuthLocks,
 ) -> PreparedServerStartup {
     let transport = if let Some(command) = &srv_cfg.command {
         let resolved_command = match resolve_template_string(command) {
@@ -1056,6 +1586,7 @@ async fn prepare_server_startup(
             &srv_cfg,
             auth_store_path.as_deref(),
             Some(&resolved_url),
+            Some(oauth_locks.clone()),
         )
         .await
         {
@@ -1067,11 +1598,39 @@ async fn prepare_server_startup(
                 };
             }
         };
+        let oauth = match &srv_cfg.auth {
+            Some(AuthConfig::OAuth {
+                client_id,
+                client_secret,
+                client_secret_env,
+                scope,
+                token_store_key,
+                token_endpoint,
+                ..
+            }) => Some(RuntimeOAuth {
+                server_id: server_id.clone(),
+                key: token_store_key
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or(&server_id)
+                    .to_string(),
+                auth_store_path: auth_store_path.clone(),
+                resolved_url: resolved_url.clone(),
+                client_id: client_id.clone(),
+                client_secret: client_secret.clone(),
+                client_secret_env: client_secret_env.clone(),
+                scope: scope.clone(),
+                token_endpoint: token_endpoint.clone(),
+                locks: oauth_locks,
+            }),
+            _ => None,
+        };
 
         PreparedServerTransport::Http {
             url: resolved_url,
             allow_stateless: srv_cfg.allow_stateless,
             headers,
+            oauth,
         }
     } else {
         PreparedServerTransport::Invalid(readiness(
@@ -1103,6 +1662,7 @@ async fn initialize_prepared_server(
     } = prepared;
     info!(%server_id, "starting upstream server");
 
+    let mut streamable_actor = None;
     let mcp_client = match transport {
         PreparedServerTransport::Invalid(readiness) => {
             warn!(%server_id, code = %readiness.code, message = %readiness.message, retryable = readiness.retryable, "skipping upstream server during startup");
@@ -1167,12 +1727,14 @@ async fn initialize_prepared_server(
             url,
             allow_stateless,
             headers,
+            oauth,
         } => {
             if allow_stateless.unwrap_or(false) {
                 return initialize_stateless_http_server(
                     server_id,
                     url,
                     headers,
+                    oauth,
                     capability_aliases,
                     resource_aliases,
                     prompt_aliases,
@@ -1181,7 +1743,10 @@ async fn initialize_prepared_server(
                 .await;
             }
 
-            let http_client = match reqwest::Client::builder().default_headers(headers).build() {
+            let http_client = match reqwest::Client::builder()
+                .default_headers(headers.clone())
+                .build()
+            {
                 Ok(value) => value,
                 Err(error) => {
                     let readiness = readiness(
@@ -1201,12 +1766,13 @@ async fn initialize_prepared_server(
                 }
             };
 
-            let mut transport_config = StreamableHttpClientTransportConfig::with_uri(url);
+            let mut transport_config = StreamableHttpClientTransportConfig::with_uri(url.clone());
             if let Some(allow_stateless) = allow_stateless {
                 transport_config.allow_stateless = allow_stateless;
             }
             let transport =
                 StreamableHttpClientTransport::with_client(http_client, transport_config);
+            streamable_actor = Some((url, allow_stateless, headers, oauth));
             match ().serve(transport).await {
                 Ok(value) => value,
                 Err(error) => {
@@ -1368,66 +1934,333 @@ async fn initialize_prepared_server(
 
     let (tx, mut rx) = mpsc::channel::<ServerMsg>(32);
     let per_server_timeout = Duration::from_millis(tool_timeout_ms);
-    tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            match msg {
-                ServerMsg::CallTool {
-                    name,
-                    params,
-                    reply,
-                } => {
-                    let req = CallToolRequestParams {
-                        name: name.into(),
-                        arguments: params.as_object().cloned(),
-                        meta: None,
-                        task: None,
-                    };
+    if let Some((actor_url, actor_allow_stateless, actor_headers, actor_oauth)) = streamable_actor {
+        let actor_server_id = server_id.clone();
+        tokio::spawn(async move {
+            let mut base_headers = actor_headers.clone();
+            base_headers.remove(AUTHORIZATION);
+            let mut token = bearer_token(&actor_headers);
+            let connect = |headers: HeaderMap| {
+                let server_id = actor_server_id.clone();
+                let url = actor_url.clone();
+                async move {
+                    let http_client = reqwest::Client::builder()
+                        .default_headers(headers)
+                        .build()
+                        .map_err(|error| {
+                            UpstreamCallError::Upstream(format!(
+                                "Failed to build HTTP client for {}: {}",
+                                server_id, error
+                            ))
+                        })?;
+                    let mut transport_config = StreamableHttpClientTransportConfig::with_uri(url);
+                    if let Some(allow_stateless) = actor_allow_stateless {
+                        transport_config.allow_stateless = allow_stateless;
+                    }
+                    let transport =
+                        StreamableHttpClientTransport::with_client(http_client, transport_config);
+                    ().serve(transport).await.map_err(|error| {
+                        UpstreamCallError::Upstream(format!(
+                            "Failed to negotiate streamable HTTP MCP connection for {}: {}",
+                            server_id, error
+                        ))
+                    })
+                }
+            };
+            let mut mcp_client = mcp_client;
 
-                    let result = timeout(per_server_timeout, mcp_client.call_tool(req)).await;
-                    let res = match result {
-                        Ok(Ok(call_res)) => {
-                            Ok(serde_json::to_value(call_res).unwrap_or(Value::Null))
+            while let Some(msg) = rx.recv().await {
+                if let Some(oauth) = actor_oauth.as_ref() {
+                    let next = match oauth.access_token(false).await {
+                        Ok(value) => value,
+                        Err(err) => {
+                            let err = Err(UpstreamCallError::Upstream(err.to_string()));
+                            match msg {
+                                ServerMsg::CallTool { reply, .. }
+                                | ServerMsg::ReadResource { reply, .. }
+                                | ServerMsg::GetPrompt { reply, .. } => {
+                                    let _ = reply.send(err);
+                                }
+                            }
+                            continue;
                         }
-                        Ok(Err(err)) => Err(UpstreamCallError::Upstream(err.to_string())),
-                        Err(_) => Err(UpstreamCallError::Timeout),
                     };
-                    let _ = reply.send(res);
+                    if token.as_deref() != Some(next.as_str()) {
+                        let headers = match auth_headers(&base_headers, &next) {
+                            Ok(value) => value,
+                            Err(err) => {
+                                let err = Err(UpstreamCallError::Upstream(err.to_string()));
+                                match msg {
+                                    ServerMsg::CallTool { reply, .. }
+                                    | ServerMsg::ReadResource { reply, .. }
+                                    | ServerMsg::GetPrompt { reply, .. } => {
+                                        let _ = reply.send(err);
+                                    }
+                                }
+                                continue;
+                            }
+                        };
+                        mcp_client = match timeout(per_server_timeout, connect(headers)).await {
+                            Ok(Ok(value)) => value,
+                            Ok(Err(err)) => {
+                                match msg {
+                                    ServerMsg::CallTool { reply, .. }
+                                    | ServerMsg::ReadResource { reply, .. }
+                                    | ServerMsg::GetPrompt { reply, .. } => {
+                                        let _ = reply.send(Err(err));
+                                    }
+                                }
+                                continue;
+                            }
+                            Err(_) => {
+                                match msg {
+                                    ServerMsg::CallTool { reply, .. }
+                                    | ServerMsg::ReadResource { reply, .. }
+                                    | ServerMsg::GetPrompt { reply, .. } => {
+                                        let _ = reply.send(Err(UpstreamCallError::Upstream(
+                                            format!(
+                                                "Timed out reconnecting streamable HTTP MCP connection for {}",
+                                                actor_server_id
+                                            ),
+                                        )));
+                                    }
+                                }
+                                continue;
+                            }
+                        };
+                        token = Some(next);
+                    }
                 }
-                ServerMsg::ReadResource { uri, reply } => {
-                    let req = ReadResourceRequestParams { meta: None, uri };
-                    let result = timeout(per_server_timeout, mcp_client.read_resource(req)).await;
-                    let res = match result {
-                        Ok(Ok(read_res)) => {
-                            Ok(serde_json::to_value(read_res).unwrap_or(Value::Null))
+
+                match msg {
+                    ServerMsg::CallTool {
+                        name,
+                        params,
+                        reply,
+                    } => {
+                        let req = CallToolRequestParams {
+                            name: name.clone().into(),
+                            arguments: params.as_object().cloned(),
+                            meta: None,
+                            task: None,
+                        };
+                        let mut res =
+                            match timeout(per_server_timeout, mcp_client.call_tool(req)).await {
+                                Ok(Ok(call_res)) => {
+                                    Ok(serde_json::to_value(call_res).unwrap_or(Value::Null))
+                                }
+                                Ok(Err(err)) => Err(UpstreamCallError::Upstream(err.to_string())),
+                                Err(_) => Err(UpstreamCallError::Timeout),
+                            };
+                        if matches!(&res, Err(UpstreamCallError::Upstream(err)) if actor_oauth.is_some() && auth_error(err))
+                        {
+                            if let Some(oauth) = actor_oauth.as_ref() {
+                                if let Ok(next) = oauth.access_token(true).await {
+                                    if let Ok(headers) = auth_headers(&base_headers, &next) {
+                                        if let Ok(Ok(value)) =
+                                            timeout(per_server_timeout, connect(headers)).await
+                                        {
+                                            mcp_client = value;
+                                            token = Some(next);
+                                            let req = CallToolRequestParams {
+                                                name: name.into(),
+                                                arguments: params.as_object().cloned(),
+                                                meta: None,
+                                                task: None,
+                                            };
+                                            res = match timeout(
+                                                per_server_timeout,
+                                                mcp_client.call_tool(req),
+                                            )
+                                            .await
+                                            {
+                                                Ok(Ok(call_res)) => {
+                                                    Ok(serde_json::to_value(call_res)
+                                                        .unwrap_or(Value::Null))
+                                                }
+                                                Ok(Err(err)) => Err(UpstreamCallError::Upstream(
+                                                    err.to_string(),
+                                                )),
+                                                Err(_) => Err(UpstreamCallError::Timeout),
+                                            };
+                                        }
+                                    }
+                                }
+                            }
                         }
-                        Ok(Err(err)) => Err(UpstreamCallError::Upstream(err.to_string())),
-                        Err(_) => Err(UpstreamCallError::Timeout),
-                    };
-                    let _ = reply.send(res);
-                }
-                ServerMsg::GetPrompt {
-                    name,
-                    arguments,
-                    reply,
-                } => {
-                    let req = GetPromptRequestParams {
-                        meta: None,
+                        let _ = reply.send(res);
+                    }
+                    ServerMsg::ReadResource { uri, reply } => {
+                        let req = ReadResourceRequestParams {
+                            meta: None,
+                            uri: uri.clone(),
+                        };
+                        let mut res = match timeout(
+                            per_server_timeout,
+                            mcp_client.read_resource(req),
+                        )
+                        .await
+                        {
+                            Ok(Ok(read_res)) => {
+                                Ok(serde_json::to_value(read_res).unwrap_or(Value::Null))
+                            }
+                            Ok(Err(err)) => Err(UpstreamCallError::Upstream(err.to_string())),
+                            Err(_) => Err(UpstreamCallError::Timeout),
+                        };
+                        if matches!(&res, Err(UpstreamCallError::Upstream(err)) if actor_oauth.is_some() && auth_error(err))
+                        {
+                            if let Some(oauth) = actor_oauth.as_ref() {
+                                if let Ok(next) = oauth.access_token(true).await {
+                                    if let Ok(headers) = auth_headers(&base_headers, &next) {
+                                        if let Ok(Ok(value)) =
+                                            timeout(per_server_timeout, connect(headers)).await
+                                        {
+                                            mcp_client = value;
+                                            token = Some(next);
+                                            let req = ReadResourceRequestParams { meta: None, uri };
+                                            res = match timeout(
+                                                per_server_timeout,
+                                                mcp_client.read_resource(req),
+                                            )
+                                            .await
+                                            {
+                                                Ok(Ok(read_res)) => {
+                                                    Ok(serde_json::to_value(read_res)
+                                                        .unwrap_or(Value::Null))
+                                                }
+                                                Ok(Err(err)) => Err(UpstreamCallError::Upstream(
+                                                    err.to_string(),
+                                                )),
+                                                Err(_) => Err(UpstreamCallError::Timeout),
+                                            };
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let _ = reply.send(res);
+                    }
+                    ServerMsg::GetPrompt {
                         name,
                         arguments,
-                    };
-                    let result = timeout(per_server_timeout, mcp_client.get_prompt(req)).await;
-                    let res = match result {
-                        Ok(Ok(prompt_res)) => {
-                            Ok(serde_json::to_value(prompt_res).unwrap_or(Value::Null))
+                        reply,
+                    } => {
+                        let req = GetPromptRequestParams {
+                            meta: None,
+                            name: name.clone(),
+                            arguments: arguments.clone(),
+                        };
+                        let mut res =
+                            match timeout(per_server_timeout, mcp_client.get_prompt(req)).await {
+                                Ok(Ok(prompt_res)) => {
+                                    Ok(serde_json::to_value(prompt_res).unwrap_or(Value::Null))
+                                }
+                                Ok(Err(err)) => Err(UpstreamCallError::Upstream(err.to_string())),
+                                Err(_) => Err(UpstreamCallError::Timeout),
+                            };
+                        if matches!(&res, Err(UpstreamCallError::Upstream(err)) if actor_oauth.is_some() && auth_error(err))
+                        {
+                            if let Some(oauth) = actor_oauth.as_ref() {
+                                if let Ok(next) = oauth.access_token(true).await {
+                                    if let Ok(headers) = auth_headers(&base_headers, &next) {
+                                        if let Ok(Ok(value)) =
+                                            timeout(per_server_timeout, connect(headers)).await
+                                        {
+                                            mcp_client = value;
+                                            token = Some(next);
+                                            let req = GetPromptRequestParams {
+                                                meta: None,
+                                                name,
+                                                arguments,
+                                            };
+                                            res = match timeout(
+                                                per_server_timeout,
+                                                mcp_client.get_prompt(req),
+                                            )
+                                            .await
+                                            {
+                                                Ok(Ok(prompt_res)) => {
+                                                    Ok(serde_json::to_value(prompt_res)
+                                                        .unwrap_or(Value::Null))
+                                                }
+                                                Ok(Err(err)) => Err(UpstreamCallError::Upstream(
+                                                    err.to_string(),
+                                                )),
+                                                Err(_) => Err(UpstreamCallError::Timeout),
+                                            };
+                                        }
+                                    }
+                                }
+                            }
                         }
-                        Ok(Err(err)) => Err(UpstreamCallError::Upstream(err.to_string())),
-                        Err(_) => Err(UpstreamCallError::Timeout),
-                    };
-                    let _ = reply.send(res);
+                        let _ = reply.send(res);
+                    }
                 }
             }
-        }
-    });
+        });
+    } else {
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    ServerMsg::CallTool {
+                        name,
+                        params,
+                        reply,
+                    } => {
+                        let req = CallToolRequestParams {
+                            name: name.into(),
+                            arguments: params.as_object().cloned(),
+                            meta: None,
+                            task: None,
+                        };
+
+                        let result = timeout(per_server_timeout, mcp_client.call_tool(req)).await;
+                        let res = match result {
+                            Ok(Ok(call_res)) => {
+                                Ok(serde_json::to_value(call_res).unwrap_or(Value::Null))
+                            }
+                            Ok(Err(err)) => Err(UpstreamCallError::Upstream(err.to_string())),
+                            Err(_) => Err(UpstreamCallError::Timeout),
+                        };
+                        let _ = reply.send(res);
+                    }
+                    ServerMsg::ReadResource { uri, reply } => {
+                        let req = ReadResourceRequestParams { meta: None, uri };
+                        let result =
+                            timeout(per_server_timeout, mcp_client.read_resource(req)).await;
+                        let res = match result {
+                            Ok(Ok(read_res)) => {
+                                Ok(serde_json::to_value(read_res).unwrap_or(Value::Null))
+                            }
+                            Ok(Err(err)) => Err(UpstreamCallError::Upstream(err.to_string())),
+                            Err(_) => Err(UpstreamCallError::Timeout),
+                        };
+                        let _ = reply.send(res);
+                    }
+                    ServerMsg::GetPrompt {
+                        name,
+                        arguments,
+                        reply,
+                    } => {
+                        let req = GetPromptRequestParams {
+                            meta: None,
+                            name,
+                            arguments,
+                        };
+                        let result = timeout(per_server_timeout, mcp_client.get_prompt(req)).await;
+                        let res = match result {
+                            Ok(Ok(prompt_res)) => {
+                                Ok(serde_json::to_value(prompt_res).unwrap_or(Value::Null))
+                            }
+                            Ok(Err(err)) => Err(UpstreamCallError::Upstream(err.to_string())),
+                            Err(_) => Err(UpstreamCallError::Timeout),
+                        };
+                        let _ = reply.send(res);
+                    }
+                }
+            }
+        });
+    }
 
     InitializedServer {
         server_id: server_id.clone(),
@@ -1460,6 +2293,7 @@ pub async fn initialize_state(config: McpConfig) -> Result<AppState> {
     let capability_aliases = Arc::new(capability_aliases);
     let resource_aliases = Arc::new(resource_aliases);
     let prompt_aliases = Arc::new(prompt_aliases);
+    let oauth_locks = RuntimeOAuthLocks::default();
     let mut sorted_servers = mcp_servers.into_iter().collect::<Vec<_>>();
     sorted_servers.sort_by(|left, right| left.0.cmp(&right.0));
 
@@ -1469,7 +2303,12 @@ pub async fn initialize_state(config: McpConfig) -> Result<AppState> {
     );
 
     let prepared = join_all(sorted_servers.into_iter().map(|(server_id, srv_cfg)| {
-        prepare_server_startup(server_id, srv_cfg, auth_store_path.clone())
+        prepare_server_startup(
+            server_id,
+            srv_cfg,
+            auth_store_path.clone(),
+            oauth_locks.clone(),
+        )
     }))
     .await;
 
@@ -1554,22 +2393,32 @@ pub async fn run_daemon(port: u16, config: McpConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_http_headers, parse_stateless_http_response, prompt_items_from_value,
-        resolve_template_string, wildcard_match, Policy,
+        build_http_headers, initialize_state, now_epoch_seconds, parse_stateless_http_response,
+        prompt_items_from_value, resolve_template_string, wildcard_match, Policy, ServerMsg,
     };
     use crate::{
         auth_store::OAuthEntry,
-        config::{AuthConfig, ServerConfig},
+        config::{AuthConfig, McpConfig, ServerConfig},
     };
-    use axum::{routing::post, Form, Json, Router};
+    use axum::{
+        extract::State,
+        http::{HeaderMap, HeaderValue, StatusCode},
+        response::IntoResponse,
+        routing::post,
+        Form, Json, Router,
+    };
     use serde::Deserialize;
     use serde_json::json;
     use std::{
         collections::HashMap,
         fs,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
         time::{SystemTime, UNIX_EPOCH},
     };
-    use tokio::net::TcpListener;
+    use tokio::{net::TcpListener, sync::oneshot};
 
     fn temp_dir(prefix: &str) -> std::path::PathBuf {
         let unique = SystemTime::now()
@@ -1606,6 +2455,143 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         format!("http://{}", address)
+    }
+
+    #[derive(Clone)]
+    struct RuntimeServerState {
+        refreshes: Arc<AtomicUsize>,
+    }
+
+    async fn runtime_refresh_handler(
+        State(state): State<RuntimeServerState>,
+        Form(form): Form<RefreshForm>,
+    ) -> Json<serde_json::Value> {
+        assert_eq!(form.grant_type, "refresh_token");
+        assert_eq!(form.refresh_token, "refresh-token");
+        state.refreshes.fetch_add(1, Ordering::SeqCst);
+        Json(json!({
+            "access_token": "fresh-token",
+            "refresh_token": "rotated-refresh-token",
+            "expires_in": 3600,
+            "token_type": "Bearer"
+        }))
+    }
+
+    async fn runtime_mcp_handler(
+        State(_state): State<RuntimeServerState>,
+        headers: HeaderMap,
+        Json(body): Json<serde_json::Value>,
+    ) -> impl IntoResponse {
+        let method = body
+            .get("method")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        if method == "notifications/initialized" {
+            return StatusCode::OK.into_response();
+        }
+
+        let auth = headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        if auth != "Bearer startup-token" && auth != "Bearer fresh-token" {
+            return (StatusCode::UNAUTHORIZED, "Auth required").into_response();
+        }
+
+        let id = body.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        if method == "initialize" {
+            let mut response_headers = HeaderMap::new();
+            response_headers.insert("mcp-session-id", HeaderValue::from_static("session-1"));
+            return (
+                response_headers,
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {
+                            "tools": {},
+                            "resources": {},
+                            "prompts": {}
+                        },
+                        "serverInfo": {
+                            "name": "runtime-test",
+                            "version": "1.0.0"
+                        }
+                    }
+                })),
+            )
+                .into_response();
+        }
+        if method == "tools/list" {
+            return Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "tools": [{
+                        "name": "ping",
+                        "description": "Ping",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {}
+                        }
+                    }]
+                }
+            }))
+            .into_response();
+        }
+        if method == "resources/list" {
+            return Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "resources": [] }
+            }))
+            .into_response();
+        }
+        if method == "prompts/list" {
+            return Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "prompts": [] }
+            }))
+            .into_response();
+        }
+        if method == "tools/call" {
+            return Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "content": [{
+                        "type": "text",
+                        "text": auth.trim_start_matches("Bearer ")
+                    }]
+                }
+            }))
+            .into_response();
+        }
+
+        (
+            StatusCode::BAD_REQUEST,
+            format!("unsupported method: {}", method),
+        )
+            .into_response()
+    }
+
+    async fn spawn_runtime_server() -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        let state = RuntimeServerState {
+            refreshes: refreshes.clone(),
+        };
+        let app = Router::new()
+            .route("/mcp", post(runtime_mcp_handler))
+            .route("/oauth/token", post(runtime_refresh_handler))
+            .with_state(state);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{}", address), refreshes)
     }
 
     #[test]
@@ -1743,6 +2729,7 @@ mod tests {
             &server,
             Some(auth_store_path.to_str().unwrap()),
             Some("https://mcp.figma.com/mcp"),
+            None,
         )
         .await
         .unwrap();
@@ -1766,6 +2753,142 @@ mod tests {
         assert_eq!(
             saved_store
                 .get("figma")
+                .and_then(|entry| entry.tokens.as_ref())
+                .and_then(|tokens| tokens.refresh_token.as_deref()),
+            Some("rotated-refresh-token")
+        );
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stateless_http_actor_refreshes_expired_oauth_tokens_after_startup() {
+        let (base_url, refreshes) = spawn_runtime_server().await;
+        let dir = temp_dir("warmplane-daemon-runtime-refresh");
+        let auth_store_path = dir.join("mcp-auth.json");
+        let server_url = format!("{}/mcp", base_url);
+        let token_endpoint = format!("{}/oauth/token", base_url);
+        fs::write(
+            &auth_store_path,
+            serde_json::to_string_pretty(&HashMap::from([(
+                "notion".to_string(),
+                OAuthEntry {
+                    tokens: Some(crate::auth_store::OAuthTokens {
+                        access_token: "startup-token".to_string(),
+                        refresh_token: Some("refresh-token".to_string()),
+                        expires_at: Some(now_epoch_seconds() + 3_600),
+                        scope: None,
+                    }),
+                    discovery: Some(crate::oauth_discovery::OAuthDiscoveryMetadata {
+                        token_endpoint: Some(token_endpoint.clone()),
+                        ..Default::default()
+                    }),
+                    server_url: Some(server_url.clone()),
+                    ..Default::default()
+                },
+            )]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let state = initialize_state(McpConfig {
+            port: None,
+            tool_timeout_ms: Some(15_000),
+            auth_store_path: Some(auth_store_path.to_str().unwrap().to_string()),
+            capability_aliases: HashMap::new(),
+            resource_aliases: HashMap::new(),
+            prompt_aliases: HashMap::new(),
+            policy: None,
+            mcp_servers: HashMap::from([(
+                "notion".to_string(),
+                ServerConfig {
+                    command: None,
+                    args: vec![],
+                    env: HashMap::new(),
+                    url: Some(server_url.clone()),
+                    protocol_version: None,
+                    allow_stateless: Some(true),
+                    headers: HashMap::new(),
+                    auth: Some(AuthConfig::OAuth {
+                        client_id: None,
+                        client_name: None,
+                        client_secret: None,
+                        client_secret_env: None,
+                        redirect_uri: None,
+                        scope: None,
+                        token_store_key: Some("notion".to_string()),
+                        authorization_server: None,
+                        resource_metadata_url: None,
+                        authorization_endpoint: None,
+                        token_endpoint: None,
+                        registration_endpoint: None,
+                        code_challenge_methods_supported: vec![],
+                    }),
+                },
+            )]),
+        })
+        .await
+        .unwrap();
+
+        fs::write(
+            &auth_store_path,
+            serde_json::to_string_pretty(&HashMap::from([(
+                "notion".to_string(),
+                OAuthEntry {
+                    tokens: Some(crate::auth_store::OAuthTokens {
+                        access_token: "expired-token".to_string(),
+                        refresh_token: Some("refresh-token".to_string()),
+                        expires_at: Some(1),
+                        scope: None,
+                    }),
+                    discovery: Some(crate::oauth_discovery::OAuthDiscoveryMetadata {
+                        token_endpoint: Some(token_endpoint),
+                        ..Default::default()
+                    }),
+                    server_url: Some(server_url),
+                    ..Default::default()
+                },
+            )]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let sender = state.servers.get("notion").cloned().unwrap_or_else(|| {
+            panic!(
+                "{}",
+                state
+                    .server_readiness
+                    .get("notion")
+                    .map(|value| value.message.clone())
+                    .unwrap_or_else(|| "missing readiness".to_string())
+            )
+        });
+        let (reply_tx, reply_rx) = oneshot::channel();
+        sender
+            .send(ServerMsg::CallTool {
+                name: "ping".to_string(),
+                params: json!({}),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+
+        let value = reply_rx.await.unwrap().unwrap();
+        assert!(value.to_string().contains("fresh-token"));
+        assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+
+        let saved_store: HashMap<String, OAuthEntry> =
+            serde_json::from_str(&fs::read_to_string(&auth_store_path).unwrap()).unwrap();
+        assert_eq!(
+            saved_store
+                .get("notion")
+                .and_then(|entry| entry.tokens.as_ref())
+                .map(|tokens| tokens.access_token.as_str()),
+            Some("fresh-token")
+        );
+        assert_eq!(
+            saved_store
+                .get("notion")
                 .and_then(|entry| entry.tokens.as_ref())
                 .and_then(|tokens| tokens.refresh_token.as_deref()),
             Some("rotated-refresh-token")

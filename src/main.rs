@@ -264,7 +264,7 @@ async fn refresh_oauth_entry(
         })?;
     let token_endpoint = resolve_token_endpoint(auth, entry).with_context(|| {
             format!(
-                "Server '{}' is missing discovered token endpoint metadata. Run 'warmplane auth discover --config <path> --server {}' first",
+                "Server '{}' is missing discovered token endpoint metadata. Run 'warmplane auth discover --config <path> {}' first",
                 server, server
             )
         })?;
@@ -296,7 +296,7 @@ async fn start_oauth_entry(
 ) -> Result<(OAuthEntry, Value)> {
     let discovery = entry.discovery.as_ref().with_context(|| {
         format!(
-            "Server '{}' is missing discovered OAuth metadata. Run 'warmplane auth discover --config <path> --server {}' first",
+            "Server '{}' is missing discovered OAuth metadata. Run 'warmplane auth discover --config <path> {}' first",
             server, server
         )
     })?;
@@ -418,13 +418,13 @@ async fn exchange_oauth_entry(
 ) -> Result<OAuthEntry> {
     let expected_state = entry.oauth_state.as_deref().with_context(|| {
         format!(
-            "Server '{}' does not have a stored OAuth state. Run 'warmplane auth start --config <path> --server {}' first",
+            "Server '{}' does not have a stored OAuth state. Run 'warmplane auth start --config <path> {}' first",
             server, server
         )
     })?;
     if expected_state != state {
         anyhow::bail!(
-            "Server '{}' OAuth state mismatch. Restart auth with 'warmplane auth start --config <path> --server {}'",
+            "Server '{}' OAuth state mismatch. Restart auth with 'warmplane auth start --config <path> {}'",
             server,
             server
         );
@@ -432,7 +432,7 @@ async fn exchange_oauth_entry(
 
     let discovery = entry.discovery.as_ref().with_context(|| {
         format!(
-            "Server '{}' is missing discovered OAuth metadata. Run 'warmplane auth discover --config <path> --server {}' first",
+            "Server '{}' is missing discovered OAuth metadata. Run 'warmplane auth discover --config <path> {}' first",
             server, server
         )
     })?;
@@ -452,7 +452,7 @@ async fn exchange_oauth_entry(
         .filter(|value| !value.trim().is_empty())
         .with_context(|| {
             format!(
-                "Server '{}' is missing a stored PKCE code verifier. Restart auth with 'warmplane auth start --config <path> --server {}'",
+                "Server '{}' is missing a stored PKCE code verifier. Restart auth with 'warmplane auth start --config <path> {}'",
                 server, server
             )
         })?;

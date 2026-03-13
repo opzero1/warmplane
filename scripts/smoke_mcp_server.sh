@@ -80,6 +80,7 @@ try:
 
     expected = sorted([
         "capabilities_list",
+        "capability_find",
         "capability_describe",
         "capability_call",
         "resources_list",
